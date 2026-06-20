@@ -103,7 +103,10 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           ARTIFACT="openship-email-${TAG}-linux-amd64.tar.gz"
-          tar -czf "${ARTIFACT}" -C apps/email/release-dist .
+          # The email build script outputs to apps/email/dist/ (not
+          # release-dist — the api and email build scripts use different
+          # output dir conventions; matching their actual layouts here).
+          tar -czf "${ARTIFACT}" -C apps/email/dist .
           sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
 
