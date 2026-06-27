@@ -668,9 +668,24 @@ export async function deployComposeServices(
         logger.log(`Syncing managed edge proxy for ${proxyRoute.hostname}...\n`, "info", {
           serviceName: svc.name,
         });
-        await ensureManagedEdgeProxy(routeContext.organizationId, proxyRoute.managedSubdomain, {
-          serverId: routeContext.serverId,
-        });
+        // Best-effort: the service container is already running and any
+        // custom domain is routed locally. The managed edge proxy only
+        // wires up the free .opsh.io URL via Openship Cloud — a cloud
+        // failure here (403 owner mismatch, slug taken, unreachable) must
+        // not flip a healthy service to "failed".
+        try {
+          await ensureManagedEdgeProxy(routeContext.organizationId, proxyRoute.managedSubdomain, {
+            serverId: routeContext.serverId,
+          });
+        } catch (edgeErr) {
+          const edgeMessage = edgeErr instanceof Error ? edgeErr.message : "Unknown error";
+          logger.log(
+            `Warning: could not sync managed edge proxy for ${proxyRoute.hostname}: ${edgeMessage}. ` +
+              `The service is live; this only affects the free ${proxyRoute.hostname} URL.\n`,
+            "warn",
+            { serviceName: svc.name },
+          );
+        }
       }
 
       firstPublicUrl ??= proxyRoute
@@ -729,6 +744,35 @@ export async function deployComposeServices(
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       logger.log(`Warning: failed to stop disabled service container: ${message}\n`, "warn");
+    }
+  }
+
+  // Reap a previous SINGLE-APP container when switching single→multi. The
+  // loop above only handles the prior deployment's service_deployment rows;
+  // a single-app predecessor has none, leaving its lone container
+  // (deployment.containerId) with no owner. Destroy it unless it's the
+  // "compose" sentinel or one of the per-service containers already handled
+  // (the compose→compose case, where prevDep.containerId IS a service row).
+  if (project.activeDeploymentId) {
+    const prevDep = await repos.deployment.findById(project.activeDeploymentId);
+    const prevContainerId = prevDep?.containerId;
+    const handledContainerIds = new Set(
+      previousServiceDeps
+        .map((row) => row.containerId)
+        .filter((id): id is string => !!id),
+    );
+    if (
+      prevContainerId &&
+      prevContainerId !== "compose" &&
+      !handledContainerIds.has(prevContainerId)
+    ) {
+      try {
+        await runtime.destroy(prevContainerId);
+        logger.log(`Stopped previous single-app container (${prevContainerId.slice(0, 12)}).\n`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unknown error";
+        logger.log(`Warning: failed to stop previous single-app container: ${message}\n`, "warn");
+      }
     }
   }
 

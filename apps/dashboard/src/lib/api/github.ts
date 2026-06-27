@@ -2,6 +2,32 @@ import { api } from "./client";
 import { endpoints } from "./endpoints";
 
 /* ------------------------------------------------------------------ */
+/*  /github/status request dedup (in-flight only — NOT a cache)        */
+/* ------------------------------------------------------------------ */
+//
+// App-connection status (GET /github/status) needs a cloud round-trip. The SaaS
+// is the live source of truth, so we DON'T cache the result over time — every
+// fresh read re-probes. We only coalesce CONCURRENT calls: the Settings card +
+// library badge mounting together (or a dev double-render) share one in-flight
+// request instead of firing two. The entry clears the moment it settles, so the
+// next read is always live. `invalidateStatus()` drops a stale in-flight after a
+// connect/disconnect so a request started pre-mutation isn't reused.
+let statusInflight: Promise<unknown> | null = null;
+
+function getStatusDeduped<T = unknown>(force = false): Promise<T> {
+  if (!force && statusInflight) return statusInflight as Promise<T>;
+  const work = api.get<T>(endpoints.github.status).finally(() => {
+    if (statusInflight === work) statusInflight = null;
+  });
+  statusInflight = work;
+  return work as Promise<T>;
+}
+
+function invalidateStatus(): void {
+  statusInflight = null;
+}
+
+/* ------------------------------------------------------------------ */
 /*  GitHub Integration API                                            */
 /* ------------------------------------------------------------------ */
 
@@ -17,8 +43,17 @@ export const githubApi = {
   getUserRepos: (owner: string) =>
     api.get<any>(endpoints.github.userRepos, { params: { owner } }),
 
-  /** Check GitHub connection status */
+  /** Check GitHub connection status (live, no dedup). */
   getStatus: () => api.get<any>(endpoints.github.status),
+
+  /**
+   * GitHub connection status, de-duplicated across CONCURRENT callers (Settings
+   * card + library App badge) but always LIVE — no TTL cache. Pass `force` after
+   * a mutation to bypass a pre-mutation in-flight request. `invalidateStatus`
+   * drops any in-flight on connect/disconnect.
+   */
+  getStatusDeduped: <T = unknown>(force = false) => getStatusDeduped<T>(force),
+  invalidateStatus,
 
   /**
    * Start a GitHub connection. Pass `source` from the dashboard's

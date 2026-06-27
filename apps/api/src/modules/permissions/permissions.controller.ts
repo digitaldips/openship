@@ -20,7 +20,7 @@ import { getRequestContext, buildBackgroundContext } from "../../lib/request-con
 import { audit, auditContextFrom } from "../../lib/audit";
 import { auth } from "../../lib/auth";
 import { resolveOrgOwner } from "../../lib/org-actor";
-import * as githubService from "../github/github.service";
+import { createGitHubSource } from "../github/sources";
 
 // ─── Constants + helpers ────────────────────────────────────────────────────
 
@@ -212,8 +212,8 @@ export async function listResources(c: Context) {
       organizationId,
       label: "permissions:github-catalog",
     });
-    const home = await githubService
-      .getUserHome(ownerCtx)
+    const home = await createGitHubSource(ownerCtx)
+      .then((s) => s.getHome())
       .catch(() => ({ accounts: [], repos: [] }));
 
     if (type === "github_installation") {

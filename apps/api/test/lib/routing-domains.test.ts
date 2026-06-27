@@ -21,7 +21,6 @@ describe("buildProjectRouteDomains", () => {
     const planned = buildProjectRouteDomains({
       project: { slug: "my-app" } as any,
       projectDomains: [{ hostname: "stale.example.com", verified: true } as any],
-      customDomain: "legacy.example.com",
       managedSlug: "my-app",
       publicEndpoints: [
         { port: 3000, domain: "my-app", domainType: "free" },
@@ -37,6 +36,48 @@ describe("buildProjectRouteDomains", () => {
     ]);
     expect(planned.find((domain) => domain.hostname === `my-app.${getRoutingBaseDomain()}`)?.targetPort).toBe(3000);
     expect(planned.find((domain) => domain.hostname === "admin.example.com")?.targetPort).toBe(4000);
+  });
+
+  it("does NOT attach the free .opsh.io fallback when an endpoint has a custom domain", () => {
+    // Regression: a self-hosted deploy with a manual/custom domain was
+    // still synthesizing <slug>.opsh.io as the primary route, which then
+    // forced a (failing) cloud edge-proxy sync. The custom domain must be
+    // the only — and primary — route.
+    const planned = buildProjectRouteDomains({
+      project: { slug: "girls-collage" } as any,
+      projectDomains: [],
+      managedSlug: "girls-collage",
+      publicEndpoints: [
+        { port: 3000, customDomain: "azharmedicinegirls.org", domainType: "custom" },
+      ],
+      runtimeName: "bare",
+      usesManagedRouting: true,
+    });
+
+    expect(planned.map((domain) => domain.hostname)).toEqual(["azharmedicinegirls.org"]);
+    expect(planned.some((domain) => domain.hostname.endsWith(getRoutingBaseDomain()))).toBe(false);
+    expect(planned.some((domain) => domain.isCloud)).toBe(false);
+    const custom = planned.find((domain) => domain.hostname === "azharmedicinegirls.org");
+    expect(custom?.domainType).toBe("custom");
+    expect(custom?.isPrimary).toBe(true);
+  });
+
+  it("still attaches the free .opsh.io fallback when there is no custom domain", () => {
+    const planned = buildProjectRouteDomains({
+      project: { slug: "girls-collage" } as any,
+      projectDomains: [],
+      managedSlug: "girls-collage",
+      publicEndpoints: [
+        { port: 3000, domain: "girls-collage", domainType: "free" },
+      ],
+      runtimeName: "bare",
+      usesManagedRouting: true,
+    });
+
+    expect(planned.map((domain) => domain.hostname)).toEqual([
+      `girls-collage.${getRoutingBaseDomain()}`,
+    ]);
+    expect(planned[0]?.isCloud).toBe(true);
   });
 
   it("keeps static path targets on planned routes", () => {

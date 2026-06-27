@@ -11,6 +11,7 @@ import { repos } from "@repo/db";
 import type { DeployTarget, RuntimeMode } from "@repo/core";
 import { env } from "../config";
 import { cloudClient, getOrgCloudToken } from "./cloud/client";
+import { resolveOrgCloudUserId } from "./cloud/transport";
 import { platform } from "./controller-helpers";
 import { buildSshConfig, sshManager } from "./ssh-manager";
 
@@ -110,8 +111,15 @@ async function resolveCloudPlatformForOrg(organizationId?: string): Promise<Plat
 
   const result = await getOrgCloudToken(organizationId);
   if (!result) {
+    // getOrgCloudToken returns null for TWO different reasons — don't conflate
+    // them. A link that exists but couldn't mint a token means Cloud is
+    // unreachable / the session lapsed (transient, retryable); only a missing
+    // link is genuinely "not connected".
+    const linkedUserId = await resolveOrgCloudUserId(organizationId).catch(() => null);
     throw new Error(
-      "Cannot access cloud deployment: no member of this organization has linked Openship Cloud. Connect via Settings.",
+      linkedUserId
+        ? "Openship Cloud is unreachable right now — couldn't validate the linked session. Check the connection in Settings and try again."
+        : "No member of this organization has linked Openship Cloud. Connect via Settings.",
     );
   }
 

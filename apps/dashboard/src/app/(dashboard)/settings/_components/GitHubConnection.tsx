@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect, useCallback } from "react";
 import {
   Github,
   ExternalLink,
@@ -11,22 +12,74 @@ import {
   AlertTriangle,
   ShieldCheck,
 } from "lucide-react";
-import { useGitHub } from "@/context/GitHubContext";
+import {
+  useGitHub,
+  type GitHubConnectionState,
+  type GitHubAccount,
+} from "@/context/GitHubContext";
 import { useCloud } from "@/context/CloudContext";
 import { useModal } from "@/context/ModalContext";
 import { usePlatform } from "@/context/PlatformContext";
+import { githubApi } from "@/lib/api";
 import { SettingsSection } from "./SettingsSection";
 
+const EMPTY_STATE: GitHubConnectionState = {
+  sources: { openshipApp: { connected: false }, ghCli: { available: false } },
+  primary: null,
+};
+
 export function GitHubConnection() {
-  const {
-    state,
-    connecting,
-    loading,
-    accounts,
-    connect,
-    disconnect,
-    installUrl,
-  } = useGitHub();
+  // The Settings card owns the App-connection truth. The library context
+  // (useGitHub) is now gh-first and does NOT probe the App, so we fetch
+  // GET /github/status here — the cloud round-trip for the App badge +
+  // installations happens on THIS page only, never on a plain library browse.
+  // Actions (connect/disconnect/connecting) still come from the shared context.
+  const { connecting, connect: ctxConnect, disconnect: ctxDisconnect } = useGitHub();
+
+  const [state, setState] = useState<GitHubConnectionState>(EMPTY_STATE);
+  const [accounts, setAccounts] = useState<GitHubAccount[]>([]);
+  const [installUrl, setInstallUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const loadStatus = useCallback(async (force = false) => {
+    setLoading(true);
+    try {
+      // Live (no TTL cache) but de-duplicated across concurrent callers (the
+      // library App badge shares this in-flight request). `force` bypasses a
+      // pre-mutation in-flight after connect/disconnect.
+      const res = await githubApi.getStatusDeduped<any>(force);
+      setState(res?.state ?? EMPTY_STATE);
+      setAccounts(res?.accounts ?? []);
+      setInstallUrl(res?.installUrl || null);
+    } catch {
+      setState(EMPTY_STATE);
+      setAccounts([]);
+      setInstallUrl(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStatus();
+  }, [loadStatus]);
+
+  // Re-fetch the App status after a connect/disconnect so the card reflects
+  // the change without depending on the gh-first library refresh.
+  const connect = useCallback(
+    async (source?: "oauth" | "cli") => {
+      await ctxConnect(source);
+      await loadStatus(true);
+    },
+    [ctxConnect, loadStatus],
+  );
+  const disconnect = useCallback(
+    async (source?: "oauth" | "cli" | "all") => {
+      await ctxDisconnect(source);
+      await loadStatus(true);
+    },
+    [ctxDisconnect, loadStatus],
+  );
 
   // Self-hosted needs an active Openship Cloud connection to use the
   // GitHub App at all — the App private key lives in openship.io and

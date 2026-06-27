@@ -45,7 +45,7 @@ import {
 import { firePreDeployBackups } from "../backups/triggers/pre-deploy";
 import { buildBackgroundContext } from "../../lib/request-context";
 import * as sessionManager from "./session-manager";
-import { onFailure, onSuccess, onCancelled, type LifecycleContext } from "./deployment-lifecycle";
+import { onFailure, onSuccess, onCancelled, setDeploymentStatus, type LifecycleContext } from "./deployment-lifecycle";
 import { createBuildConfig } from "./build-config";
 import {
   executeComposePipeline,
@@ -444,6 +444,42 @@ async function emitServiceCheckRun(opts: {
 }
 
 /**
+ * Emit the initial per-service GitHub Checks for a fanned-out deploy:
+ * targeted services get an `in_progress` "start" check, non-targeted ones
+ * a neutral "skipped" check — so the PR check list is complete the moment
+ * the deploy starts. Best-effort; the returned check_run_id is persisted
+ * so the later `complete` emit patches the same Check.
+ */
+async function emitInitialServiceChecks(
+  serviceFanOut: Awaited<ReturnType<typeof preCreateServiceDeployments>>,
+  project: Project,
+  dep: Deployment,
+): Promise<void> {
+  for (const entry of serviceFanOut.values()) {
+    if (!entry.id) continue;
+    if (entry.targeted) {
+      await emitServiceCheckRun({
+        project,
+        dep,
+        serviceDeploymentId: entry.id,
+        serviceName: entry.serviceName,
+        phase: "start",
+      }).catch(() => {});
+    } else {
+      await emitServiceCheckRun({
+        project,
+        dep,
+        serviceDeploymentId: entry.id,
+        serviceName: entry.serviceName,
+        phase: "complete",
+        conclusion: "neutral",
+        output: { title: "Skipped — no changes", summary: "Files under this service's root were unchanged." },
+      }).catch(() => {});
+    }
+  }
+}
+
+/**
  * Roll up per-service results into the project-level deployment status.
  *
  *   - all `success` (or `skipped`)          → `ready`
@@ -462,6 +498,107 @@ function rollupDeploymentStatus(
   if (failures === 0) return "ready";
   if (successes === 0) return "failed";
   return "partial_failure";
+}
+
+/**
+ * Hand the previous-active deployment to the rollback orchestrator: it
+ * archives the prior artifact (so snapshot rollback stays possible), sets
+ * artifact_retained_at on both rows, and prunes beyond the rollback
+ * window. Git-strategy deploys SKIP this — rollback re-clones at
+ * commit_sha_before, so there's no artifact to archive. Best-effort: the
+ * new deployment is already live, so a failure here only affects rollback
+ * eligibility, never the deploy outcome.
+ */
+async function archivePreviousDeployment(
+  dep: Deployment,
+  project: Project,
+  logger: BuildLogger,
+): Promise<void> {
+  if (dep.rollbackStrategy === "git") {
+    logger.log(
+      "Skipping snapshot/artifact archive — rollback strategy is 'git' (rollback re-clones at commit_sha_before).",
+    );
+    return;
+  }
+  try {
+    const { onDeploymentReady } = await import("./rollback");
+    const finalDep = await repos.deployment.findById(dep.id);
+    const prevDep = project.activeDeploymentId
+      ? await repos.deployment.findById(project.activeDeploymentId)
+      : null;
+    if (finalDep) {
+      await onDeploymentReady({ newDeployment: finalDep, previousActive: prevDep ?? null });
+    }
+  } catch (err) {
+    logger.log(
+      `Warning: failed to archive previous deployment for rollback: ${safeErrorMessage(err)}\n`,
+      "warn",
+    );
+  }
+}
+
+/**
+ * Finalize a compose (multi-service) deploy after executeComposePipeline:
+ * roll the per-service results up into the project-level status (override
+ * `ready` with `partial_failure` when some services failed), emit
+ * per-service GitHub Checks, then archive the previous deployment.
+ * Mirrors the single-app finalize tail in executeServerDeploy.
+ */
+async function finalizeComposeDeploy(opts: {
+  project: Project;
+  dep: Deployment;
+  logger: BuildLogger;
+}): Promise<void> {
+  const { project, dep, logger } = opts;
+
+  // Rollup + per-service Checks. Failures here must not roll back the deploy.
+  try {
+    const finalDep = await repos.deployment.findById(dep.id);
+    if (finalDep && finalDep.status === "ready") {
+      const perService = await repos.serviceDeployment.listByDeployment(dep.id);
+      const rolled = rollupDeploymentStatus(perService);
+      if (rolled === "partial_failure") {
+        // partial_failure is a DB-only concept; SSE stays "ready" (the
+        // dashboard reads partial_failure off the row) and surfaces the
+        // partial as a live warning banner.
+        await setDeploymentStatus(dep.id, "partial_failure", {
+          sse: {
+            status: "ready",
+            meta: { warningMessage: "Some services failed — see service deployments for details." },
+          },
+        });
+      } else if (rolled === "failed") {
+        // Shouldn't happen — the compose pipeline marks ready only on
+        // at-least-one success — but guard defensively.
+        await setDeploymentStatus(dep.id, "failed");
+      }
+
+      // Per-service Checks API events.
+      for (const sd of perService) {
+        if (!sd.serviceName) continue;
+        if (sd.status === "skipped") continue; // already emitted up front
+        const conclusion =
+          sd.status === "success" ? "success" : sd.status === "cancelled" ? "cancelled" : "failure";
+        await emitServiceCheckRun({
+          project,
+          dep,
+          serviceDeploymentId: sd.id,
+          serviceName: sd.serviceName,
+          phase: "complete",
+          conclusion,
+          output: {
+            title: `${sd.serviceName} ${conclusion}`,
+            summary: sd.errorMessage ?? sd.error ?? "",
+          },
+        }).catch(() => {});
+      }
+    }
+  } catch (err) {
+    // Rollup failures must not roll back the deploy.
+    console.warn(`[build] rollup/Checks emission failed for ${dep.id}:`, err);
+  }
+
+  await archivePreviousDeployment(dep, project, logger);
 }
 
 // ─── Build & Deploy pipeline (private) ───────────────────────────────────────
@@ -519,12 +656,11 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     const targetExecutor: CommandExecutor | null = resolved.platform.executor;
 
     // ── Build phase ──────────────────────────────────────────────────
-    await repos.deployment.updateStatus(dep.id, "building");
     await repos.deployment.updateBuildSession(buildSessionId, {
       status: "building",
       startedAt: new Date(),
     });
-    sessionManager.updateStatus(dep.id, "building");
+    await setDeploymentStatus(dep.id, "building");
 
     // ── Smart per-service fan-out ────────────────────────────────────
     // Pre-create service_deployment rows so the dashboard sees a
@@ -545,37 +681,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       return new Map<string, { id: string; serviceId: string; serviceName: string; targeted: boolean }>();
     });
 
-    // Emit neutral "skipped" Checks immediately for non-targeted
-    // services so the PR check list reflects them as soon as the
-    // deploy starts — without waiting for the build to finish.
-    // Targeted services get an `in_progress` Check at the same time so
-    // the PR shows a "Running" row from the start (instead of nothing
-    // until the final `complete` emission patches the row at the end).
-    // The returned check_run_id is persisted onto the
-    // service_deployment row so the later `complete` emit updates the
-    // same Check rather than creating a duplicate.
-    for (const entry of serviceFanOut.values()) {
-      if (!entry.id) continue;
-      if (entry.targeted) {
-        await emitServiceCheckRun({
-          project,
-          dep,
-          serviceDeploymentId: entry.id,
-          serviceName: entry.serviceName,
-          phase: "start",
-        }).catch(() => {});
-      } else {
-        await emitServiceCheckRun({
-          project,
-          dep,
-          serviceDeploymentId: entry.id,
-          serviceName: entry.serviceName,
-          phase: "complete",
-          conclusion: "neutral",
-          output: { title: "Skipped — no changes", summary: "Files under this service's root were unchanged." },
-        }).catch(() => {});
-      }
-    }
+    await emitInitialServiceChecks(serviceFanOut, project, dep);
 
     const prodResources = withDefaults(snapshot.resources);
     const buildResources = withDefaults(snapshot.buildResources, DEFAULT_BUILD_RESOURCE_CONFIG);
@@ -678,93 +784,9 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
         gitToken: gitToken ?? undefined,
       });
 
-      // ── Roll up per-service results into the project-level status ──
-      // The compose pipeline ends with `ready` (via onSuccess) or
-      // `failed` (via onFailure). For the mixed case — some services
-      // up, others down — we override `ready` with `partial_failure`.
-      // Per-service GitHub Checks are also emitted at this point so
-      // the PR check list reflects each service's final state.
-      try {
-        const finalDep = await repos.deployment.findById(dep.id);
-        if (finalDep && finalDep.status === "ready") {
-          const perService = await repos.serviceDeployment.listByDeployment(dep.id);
-          const rolled = rollupDeploymentStatus(perService);
-          if (rolled === "partial_failure") {
-            await repos.deployment.updateStatus(dep.id, "partial_failure");
-            // session-manager's BuildSessionState only knows the
-            // legacy 6 statuses. partial_failure is a deployment-row
-            // concept; SSE-side it stays `ready` (dashboard reads
-            // partial_failure off the DB row), and we surface the
-            // partial in `warningMessage` for the live banner.
-            sessionManager.updateStatus(dep.id, "ready", {
-              warningMessage: "Some services failed — see service deployments for details.",
-            });
-          } else if (rolled === "failed" && finalDep.status === "ready") {
-            // Shouldn't happen — compose pipeline marks ready only on
-            // at-least-one success — but guard defensively.
-            await repos.deployment.updateStatus(dep.id, "failed");
-            sessionManager.updateStatus(dep.id, "failed");
-          }
-
-          // Per-service Checks API events.
-          for (const sd of perService) {
-            if (!sd.serviceName) continue;
-            const isSkipped = sd.status === "skipped";
-            if (isSkipped) continue; // already emitted up front
-            const conclusion =
-              sd.status === "success"
-                ? "success"
-                : sd.status === "cancelled"
-                  ? "cancelled"
-                  : "failure";
-            await emitServiceCheckRun({
-              project,
-              dep,
-              serviceDeploymentId: sd.id,
-              serviceName: sd.serviceName,
-              phase: "complete",
-              conclusion,
-              output: {
-                title: `${sd.serviceName} ${conclusion}`,
-                summary: sd.errorMessage ?? sd.error ?? "",
-              },
-            }).catch(() => {});
-          }
-        }
-      } catch (err) {
-        // Rollup failures must not roll back the deploy.
-        console.warn(`[build] rollup/Checks emission failed for ${dep.id}:`, err);
-      }
-
-      // Hand the previous-active deployment over to the rollback orchestrator
-      // for compose deploys too. Without this call, multi-service projects
-      // never archive the prior deployment — artifact_retained_at never gets
-      // set and snapshot rollback eligibility is silently broken.
-      //
-      // Mirrors the executeServerDeploy git-strategy guard: git-strategy
-      // deploys SKIP this entirely since rollback re-clones at commit_sha_before.
-      if (dep.rollbackStrategy !== "git") {
-        try {
-          const { onDeploymentReady } = await import("./rollback");
-          const finalDep = await repos.deployment.findById(dep.id);
-          const prevDep = project.activeDeploymentId
-            ? await repos.deployment.findById(project.activeDeploymentId)
-            : null;
-          if (finalDep) {
-            await onDeploymentReady({
-              newDeployment: finalDep,
-              previousActive: prevDep ?? null,
-            });
-          }
-        } catch (err) {
-          console.warn(`[build] onDeploymentReady (compose) failed for ${dep.id}:`, err);
-        }
-      } else {
-        logger.log(
-          "Skipping snapshot/artifact archive — rollback strategy is 'git' (rollback re-clones at commit_sha_before).",
-        );
-      }
-
+      // Roll per-service results up into the project status, emit
+      // per-service Checks, and archive the previous deployment.
+      await finalizeComposeDeploy({ project, dep, logger });
       return;
     }
 
@@ -805,11 +827,9 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     }
 
     // ── Deploy phase ─────────────────────────────────────────────────
-    await repos.deployment.updateStatus(dep.id, "deploying", {
-      imageRef: buildResult.imageRef,
-      buildDurationMs: buildResult.durationMs,
+    await setDeploymentStatus(dep.id, "deploying", {
+      extra: { imageRef: buildResult.imageRef, buildDurationMs: buildResult.durationMs },
     });
-    sessionManager.updateStatus(dep.id, "deploying");
 
     const phase: DeployPhaseInputs = {
       ctx,
@@ -931,11 +951,97 @@ async function executeStaticEdgeDeploy(
   }
 }
 
+/**
+ * Build the runtime DeployEnvironment (preflight + activate + deactivate +
+ * route/url resolvers) for a server deploy. Static-self-hosted (bare,
+ * file-backed) and containerized server deploys share one shape but differ
+ * in a handful of closures — kept together here so executeServerDeploy
+ * reads as a straight sequence.
+ */
+function buildDeployEnvironment(
+  phase: DeployPhaseInputs,
+  deps: {
+    staticBareRuntime: BareRuntime | null;
+    isStaticSelfHosted: boolean;
+    previousRuntime: DeployPhaseInputs["runtime"];
+    plannedDomains: ReturnType<typeof buildProjectRouteDomains>;
+  },
+): DeployEnvironment {
+  const { runtime, system, targetExecutor, routeState, snapshot, logger } = phase;
+  const { staticBareRuntime, isStaticSelfHosted, previousRuntime, plannedDomains } = deps;
+
+  return {
+    preflight: targetExecutor
+      ? async (cfg, promptUser) => {
+          if (system) {
+            const systemLog = (entry: { message: string; level: "info" | "warn" | "error" }) => {
+              logger.log(`${entry.message}\n`, entry.level);
+            };
+
+            if (!isStaticSelfHosted) {
+              await system.ensureFeature("deploy", systemLog);
+            }
+            if (plannedDomains.length > 0) {
+              await system.ensureFeature("routing", systemLog);
+            }
+            if (plannedDomains.some((d) => d.provisionSsl)) {
+              await system.ensureFeature("ssl", systemLog);
+            }
+          }
+
+          if (!isStaticSelfHosted) {
+            const ports = Array.from(
+              new Set(
+                (routeState.publicEndpoints.length > 0
+                  ? routeState.publicEndpoints
+                  : [{ port: cfg.port }])
+                  .map((endpoint) => endpoint.port ?? cfg.port)
+                  .filter((port): port is number => Number.isFinite(port)),
+              ),
+            );
+
+            for (const port of ports) {
+              await ensurePortAvailable(targetExecutor, port, logger, promptUser);
+            }
+          }
+        }
+      : undefined,
+    activate: async (cfg, onLog) => {
+      const r = isStaticSelfHosted
+        ? await staticBareRuntime!.deployStatic({
+            ...cfg,
+            outputDirectory: cfg.outputDirectory ?? snapshot.outputDirectory,
+          })
+        : await runtime.deploy(cfg, onLog);
+      if (!r.containerId) throw new Error("Deploy produced no container");
+      return { containerId: r.containerId, url: r.url };
+    },
+    deactivate: (id) =>
+      previousRuntime.name === "bare" && !id.includes("/")
+        ? previousRuntime.stop(id)
+        : previousRuntime.destroy(id),
+    resolveRoute: isStaticSelfHosted
+      ? async (id, cfg) => ({
+          staticRoot: staticBareRuntime!.resolveStaticRoot(
+            id,
+            cfg.outputDirectory ?? snapshot.outputDirectory,
+          ),
+        })
+      : undefined,
+    resolveTargetUrl: runtime.supports("containerIp")
+      ? async (id, port) => {
+          const ip = await runtime.getContainerIp(id);
+          return ip ? `http://${ip}:${port}` : null;
+        }
+      : undefined,
+  };
+}
+
 /** Server deploy via runDeployPipeline (VM / Docker / Bare). Handles static-self-hosted too. */
 async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
   const {
     ctx, project, dep, snapshot, buildSessionId,
-    runtime, routing, ssl, system, targetExecutor, usesManagedRouting,
+    runtime, routing, ssl, usesManagedRouting,
     routeState, buildResult, envMap, prodResources, logger,
   } = phase;
 
@@ -976,10 +1082,11 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
         .catch(() => runtime)
     : runtime;
 
-  // ── Gather all domains that need routing ───────────────────────────
-  // Sources: custom domain, verified DB domains, free host subdomain.
-  // Every domain gets an OpenResty route; SSL is provisioned only for
-  // custom domains - the free host subdomain skips SSL (user manages it).
+  // ── Plan + persist this deploy's routes ────────────────────────────
+  // buildProjectRouteDomains turns the project's public endpoints (and
+  // existing domain rows) into concrete routes. We persist a domain
+  // record for each up front because SSL provisioning inside
+  // runDeployPipeline writes cert status back onto these rows.
   const projectDomains = await repos.domain.listByProject(project.id);
   const domainByHostname = new Map(
     projectDomains.map((domain) => [domain.hostname.toLowerCase(), domain]),
@@ -987,22 +1094,37 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
   const plannedDomains = buildProjectRouteDomains({
     project,
     projectDomains,
-    customDomain: routeState.primaryCustomDomain,
     managedSlug: routeState.publicEndpoints.length > 0 ? routeState.primarySlug : undefined,
     publicEndpoints: routeState.publicEndpoints,
     runtimeName: runtime.name,
     usesManagedRouting,
   });
+  // Domains to prune after a successful deploy: project-level rows that
+  // no longer back a current public endpoint AND aren't among the routes
+  // we just planned. The size>0 guard is a safety valve — if endpoint
+  // resolution yielded nothing (transient/empty), prune nothing rather
+  // than nuke every route. The plannedHostnames check is belt-and-braces:
+  // never prune a hostname this same deploy is registering.
   const activeRouteIds = new Set(
     routeState.publicEndpoints
       .map((endpoint) => endpoint.id)
       .filter((id): id is string => !!id),
   );
+  const plannedHostnames = new Set(plannedDomains.map((domain) => domain.hostname.toLowerCase()));
   const obsoleteProjectDomains = activeRouteIds.size > 0
-    ? projectDomains.filter((domain) => !domain.serviceId && !activeRouteIds.has(domain.id))
+    ? projectDomains.filter(
+        (domain) =>
+          !domain.serviceId &&
+          !activeRouteIds.has(domain.id) &&
+          !plannedHostnames.has(domain.hostname.toLowerCase()),
+      )
     : [];
 
-  // Persist domain records for any new planned domains (free subdomain, custom domain)
+  // Persist a domain record for each planned route. Track the ones we
+  // CREATE here (vs pre-existing rows) so they can be rolled back if the
+  // deploy fails — otherwise a failed deploy leaves orphan domain rows
+  // that resurface as routes on the next deploy.
+  const createdDomainIds: string[] = [];
   for (const route of plannedDomains) {
     const created = await ensureRouteDomainRecord({
       projectId: project.id,
@@ -1010,76 +1132,18 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
       domainByHostname,
     });
     if (created && !projectDomains.some((d) => d.id === created.id)) {
+      createdDomainIds.push(created.id);
       logger.log(`Created domain record for "${route.hostname}".\n`);
     }
   }
 
-  // Compose deploy environment from runtime adapter
-  const deployEnv: DeployEnvironment = {
-    preflight: targetExecutor
-      ? async (cfg, promptUser) => {
-          if (system) {
-            const systemLog = (entry: { message: string; level: "info" | "warn" | "error" }) => {
-              logger.log(`${entry.message}\n`, entry.level);
-            };
-
-            if (!isStaticSelfHosted) {
-              await system.ensureFeature("deploy", systemLog);
-            }
-            if (plannedDomains.length > 0) {
-              await system.ensureFeature("routing", systemLog);
-            }
-            if (plannedDomains.some((d) => d.provisionSsl)) {
-              await system.ensureFeature("ssl", systemLog);
-            }
-          }
-
-          if (!isStaticSelfHosted) {
-            const ports = Array.from(
-              new Set(
-                (routeState.publicEndpoints.length > 0
-                  ? routeState.publicEndpoints
-                  : [{ port: cfg.port }])
-                  .map((endpoint) => endpoint.port ?? cfg.port)
-                  .filter((port): port is number => Number.isFinite(port)),
-              ),
-            );
-
-            for (const port of ports) {
-              await ensurePortAvailable(targetExecutor, port, logger, promptUser);
-            }
-          }
-        }
-      : undefined,
-    activate: async (cfg, onLog) => {
-      const r = isStaticSelfHosted
-        ? await staticBareRuntime.deployStatic({
-            ...cfg,
-            outputDirectory: cfg.outputDirectory ?? snapshot.outputDirectory,
-          })
-        : await runtime.deploy(cfg, onLog);
-      if (!r.containerId) throw new Error("Deploy produced no container");
-      return { containerId: r.containerId, url: r.url };
-    },
-    deactivate: (id) =>
-      previousRuntime.name === "bare" && !id.includes("/")
-        ? previousRuntime.stop(id)
-        : previousRuntime.destroy(id),
-    resolveRoute: isStaticSelfHosted
-      ? async (id, cfg) => ({
-          staticRoot: staticBareRuntime.resolveStaticRoot(
-            id,
-            cfg.outputDirectory ?? snapshot.outputDirectory,
-          ),
-        })
-      : undefined,
-    resolveTargetUrl: runtime.supports("containerIp")
-      ? async (id, port) => {
-          const ip = await runtime.getContainerIp(id);
-          return ip ? `http://${ip}:${port}` : null;
-        }
-      : undefined,
-  };
+  // Runtime deploy environment (preflight + activate + deactivate + resolvers).
+  const deployEnv = buildDeployEnvironment(phase, {
+    staticBareRuntime,
+    isStaticSelfHosted,
+    previousRuntime,
+    plannedDomains,
+  });
 
   const deploySsl = plannedDomains.some((domain) => domain.provisionSsl)
     ? createTrackedSslProvider(ssl, domainByHostname)
@@ -1110,6 +1174,34 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     );
   }
 
+  // Reap leftover containers from a previous MULTI-SERVICE / monorepo
+  // deployment when this deploy collapses to single-app mode. runDeployPipeline
+  // only deactivates prevDep.containerId — which in compose mode is just the
+  // old primary service's container (or the literal "compose" sentinel, not a
+  // real container) — so the remaining per-service containers
+  // (openship-{slug}-{service}) have no owner in the single-app path and would
+  // otherwise orphan. Skip the one runDeployPipeline already handles and the
+  // sentinel. Best-effort; never blocks the deploy.
+  if (prevDep) {
+    const prevServiceDeps = await repos.service
+      .listByDeployment(prevDep.id)
+      .catch(() => []);
+    for (const sd of prevServiceDeps) {
+      if (!sd.containerId || sd.containerId === "compose" || sd.containerId === prevDep.containerId) {
+        continue;
+      }
+      try {
+        await previousRuntime.destroy(sd.containerId);
+        logger.log(`Stopped leftover service container (${sd.containerId.slice(0, 12)}).\n`);
+      } catch (err) {
+        logger.log(
+          `Warning: failed to stop leftover service container: ${safeErrorMessage(err)}\n`,
+          "warn",
+        );
+      }
+    }
+  }
+
   const deployResult = await runDeployPipeline(
     deployEnv,
     {
@@ -1130,6 +1222,28 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
   );
 
   if (deployResult.status === "failed") {
+    // Reap the container this deploy STARTED if it failed during/after routing.
+    // activeDeploymentId only advances on SUCCESS, so a started-but-failed
+    // container is never any future deploy's prevDep and the 1-deep
+    // prev-deactivation can never reach it — that's exactly how containers
+    // piled up (3 for one project). Destroy it via the current runtime now.
+    // Static deploys have no container. Best-effort + idempotent.
+    if (deployResult.containerId && !isStaticSelfHosted) {
+      await runtime.destroy(deployResult.containerId).catch((err) =>
+        logger.log(
+          `Warning: failed to clean up container after deploy failure: ${safeErrorMessage(err)}\n`,
+          "warn",
+        ),
+      );
+    }
+    // Roll back the domain rows this deploy created — it didn't take, so
+    // its routes must not linger (they'd resurface as planned routes next
+    // deploy). Best-effort; pre-existing rows are left untouched.
+    for (const id of createdDomainIds) {
+      await repos.domain.remove(id).catch((err) =>
+        logger.log(`Warning: failed to roll back domain record: ${safeErrorMessage(err)}\n`, "warn"),
+      );
+    }
     await onFailure(ctx, deployResult.error, buildResult.durationMs, {
       errorCode: deployResult.errorCode,
       errorDetails: deployResult.errorDetails,
@@ -1157,28 +1271,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     durationMs: buildResult.durationMs ?? 0,
   });
 
-  // Hand the previous-active deployment over to the rollback orchestrator.
-  // It archives the artifact (preserves rollback eligibility), sets
-  // artifact_retained_at on both prev + new, and runs retention prune.
-  //
-  // Git-strategy deploys SKIP this entirely: rollback for them
-  // re-clones at `commit_sha_before` and rebuilds, so there's no
-  // artifact to archive (and archiving would waste disk on something
-  // we never read back). Snapshot strategy is the unchanged default.
-  if (dep.rollbackStrategy !== "git") {
-    const { onDeploymentReady } = await import("./rollback");
-    const finalDep = await repos.deployment.findById(dep.id);
-    if (finalDep) {
-      await onDeploymentReady({
-        newDeployment: finalDep,
-        previousActive: prevDep ?? null,
-      });
-    }
-  } else {
-    logger.log(
-      "Skipping snapshot/artifact archive — rollback strategy is 'git' (rollback re-clones at commit_sha_before).",
-    );
-  }
+  await archivePreviousDeployment(dep, project, logger);
 }
 
 /** After a successful deploy: managed-edge sync + prune obsolete
@@ -1201,7 +1294,18 @@ async function runPostDeploySync(opts: {
   if (usesManagedRouting) {
     for (const domain of plannedDomains.filter((d) => d.isCloud && d.managedSubdomain)) {
       logger.log(`Syncing managed edge proxy for ${domain.hostname}...\n`);
-      await ensureManagedEdgeProxy(organizationId, domain.managedSubdomain!, { serverId });
+      // Best-effort: this only wires the free .opsh.io URL through cloud
+      // edge. Containers are up and custom domains route locally, so a
+      // cloud failure (403, slug taken, unreachable) must not fail the deploy.
+      try {
+        await ensureManagedEdgeProxy(organizationId, domain.managedSubdomain!, { serverId });
+      } catch (err) {
+        logger.log(
+          `Warning: could not sync managed edge proxy for ${domain.hostname}: ${safeErrorMessage(err)}. ` +
+            `The deployment is live; this only affects the free ${domain.hostname} URL.\n`,
+          "warn",
+        );
+      }
     }
   }
 

@@ -300,6 +300,24 @@ export function createProjectRepo(db: Database) {
         .where(eq(project.id, id));
     },
 
+    /**
+     * Boot-time sweep of stuck deletion locks. A `deletionInProgress=true`
+     * flag can only be left behind by a teardown that died mid-flight — no
+     * teardown survives a process restart — so at startup every such flag is
+     * necessarily stale and must be cleared, otherwise the project refuses all
+     * future deletes with "Another delete is already running" forever. Mirrors
+     * backupRun.sweepStaleRuns / backupRestore.sweepStaleRestores. Returns the
+     * number of locks cleared.
+     */
+    async clearStaleDeletions(): Promise<number> {
+      const rows = await db
+        .update(project)
+        .set({ deletionInProgress: false, updatedAt: new Date() })
+        .where(eq(project.deletionInProgress, true))
+        .returning();
+      return rows.length;
+    },
+
     /** Set the active deployment for a project */
     async setActiveDeployment(projectId: string, deploymentId: string | null) {
       await db

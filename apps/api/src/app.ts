@@ -10,6 +10,7 @@ import { originGuard } from "./middleware/origin-guard";
 import { migrationGuard } from "./middleware/migration-guard";
 import { initPlatform } from "@repo/adapters";
 import { resolvePlatformConfig } from "./lib/controller-helpers";
+import { runWithRequestStore } from "./lib/request-store";
 
 import { authRoutes } from "./modules/auth/auth.routes";
 import { projectRoutes } from "./modules/projects/project.routes";
@@ -53,6 +54,11 @@ app.use(
   }),
 );
 app.use("*", logger());
+// Seed a per-request memo store FIRST so every downstream handler shares it.
+// Collapses idempotent-per-request reads (cloud session validation, GitHub
+// auth-mode, installations) to one call each — a single /github/status was
+// fanning out into ~6 /cloud/account + 3 installations round-trips otherwise.
+app.use("*", (_c, next) => runWithRequestStore(() => next()));
 app.use("*", clientIpMiddleware);
 // CSRF defence: reject mutating requests from untrusted origins BEFORE
 // the auth chain touches the session. Webhooks (Stripe, Oblien) don't
@@ -183,9 +189,8 @@ if (env.CLOUD_MODE) {
   const { billingLocalRoutes } = await import("./modules/billing/billing-local.routes");
   app.route("/api/billing", billingLocalRoutes);
 
-  /** Start the periodic analytics scraper for managed servers */
-  const { startAnalyticsScraper } = await import("./modules/system/analytics-scraper");
-  startAnalyticsScraper();
+  // Analytics is scraped ON-DEMAND when a server's analytics is viewed
+  // (analytics.controller → scrapeServerIfStale) — no background interval.
 }
 
 // ─── Backup job runner + boot reconcile ─────────────────────────────
@@ -201,6 +206,13 @@ if (env.CLOUD_MODE) {
   const sweepStaleRestores = repos.backupRestore.sweepStaleRestores(
     "API restart while restore in flight",
   );
+  // A project's deletionInProgress flag can only survive from a teardown that
+  // died mid-flight (no teardown outlives a restart), so clear stuck locks at
+  // boot — otherwise the project refuses all deletes forever ("Another delete
+  // is already running"). Fire-and-forget; logs the count if any were stuck.
+  void repos.project.clearStaleDeletions().then((n) => {
+    if (n > 0) console.log(`[boot] cleared ${n} stale project deletion lock(s)`);
+  }).catch((err) => console.warn("[boot] clearStaleDeletions failed:", err));
 
   const runner = await getJobRunner();
   await runner.start({

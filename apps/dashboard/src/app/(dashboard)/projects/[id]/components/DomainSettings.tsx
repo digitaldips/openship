@@ -597,7 +597,14 @@ export const DomainSettings = () => {
       }
     } catch (error) {
       console.error("Failed to renew SSL:", error);
-      showToast(`Failed to renew SSL for ${hostname}.`, "error");
+      // Surface the REAL server-side reason (e.g. "certbot: command not found",
+      // ACME DNS/reachability errors) instead of a generic string — the API
+      // returns it on the ApiError body and getApiErrorMessage walks it out.
+      showToast(
+        getApiErrorMessage(error, `Failed to renew SSL for ${hostname}.`),
+        "error",
+        "SSL",
+      );
     } finally {
       setRenewingHostname(null);
     }
@@ -972,6 +979,7 @@ export const DomainSettings = () => {
                   <ActionButton
                     label={isRenewing ? "Renewing..." : "Renew SSL"}
                     icon={isRenewing ? Loader2 : ShieldAlert}
+                    spinning={isRenewing}
                     onClick={() => void handleRenewDomainSsl(domain.hostname)}
                     disabled={isRenewing}
                   />
@@ -1336,20 +1344,24 @@ function ActionButton({
   href,
   onClick,
   disabled,
+  spinning,
 }: {
   label: string;
   icon: React.ComponentType<{ className?: string }>;
   href?: string;
   onClick?: () => void;
   disabled?: boolean;
+  /** Animate the icon (use with a Loader2 icon for in-flight actions). */
+  spinning?: boolean;
 }) {
   const className =
     "inline-flex min-h-10 items-center gap-1.5 rounded-xl bg-foreground/[0.06] px-3 py-2 text-[13px] font-medium text-foreground transition-colors hover:bg-foreground/[0.1] disabled:cursor-not-allowed disabled:opacity-50";
+  const iconClassName = spinning ? "size-3.5 animate-spin" : "size-3.5";
 
   if (href) {
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" className={className}>
-        <Icon className="size-3.5" />
+        <Icon className={iconClassName} />
         {label}
       </a>
     );
@@ -1357,7 +1369,7 @@ function ActionButton({
 
   return (
     <button onClick={onClick} disabled={disabled} className={className}>
-      <Icon className="size-3.5" />
+      <Icon className={iconClassName} />
       {label}
     </button>
   );

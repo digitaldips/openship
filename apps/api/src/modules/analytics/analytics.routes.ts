@@ -19,6 +19,7 @@ const r = secureRouter(new Hono(), {
 /* ─── Request analytics ────────────────────────────────────────────────── */
 r.get("/", { tag: "analytics:read" }, ctrl.summary);
 r.get("/periods", { tag: "analytics:read" }, ctrl.periods);
+r.get("/overview", { tag: "analytics:read" }, ctrl.overview);
 
 /* ─── Deployment stats ─────────────────────────────────────────────────── */
 r.get("/deployments", { tag: "analytics:read" }, ctrl.deploymentStats);

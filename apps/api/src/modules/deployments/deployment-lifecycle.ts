@@ -13,7 +13,7 @@
  * while all side-effects on completion live here.
  */
 
-import { repos, type Project, type Deployment } from "@repo/db";
+import { repos, type Project, type Deployment, type NewDeployment } from "@repo/db";
 import { DockerRuntime, type LogEntry } from "@repo/adapters";
 import type { RuntimeAdapter } from "@repo/adapters";
 import { SYSTEM, safeErrorMessage } from "@repo/core";
@@ -21,6 +21,7 @@ import type { DeploymentMeta } from "../../lib/deployment-runtime";
 import { notification } from "../../lib/notification-dispatcher";
 import { audit } from "../../lib/audit";
 import * as sessionManager from "./session-manager";
+import type { BuildSessionState } from "./session-manager";
 import { detectAndStoreFavicon } from "../../lib/favicon-detector";
 import {
   markWebmailInstalled,
@@ -62,6 +63,44 @@ export async function cleanupBuildArtifact(
   }
 
   await runtime.destroy(artifactRef);
+}
+
+/**
+ * Set a deployment's status on BOTH layers in one call: the DB row
+ * (repos.deployment.updateStatus) and the in-memory SSE session
+ * (sessionManager.updateStatus). Every non-terminal transition needs
+ * both, and they were previously hand-written at each call site.
+ *
+ * The SSE layer only knows the legacy statuses, so for a DB-only status
+ * (e.g. "partial_failure") pass an explicit `sse.status` (typically
+ * "ready" + a warningMessage); otherwise the SSE status mirrors the DB
+ * status.
+ *
+ * NOTE: terminal completion (ready/failed/cancelled) is owned by
+ * onSuccess/onFailure/onCancelled — use those, not this helper.
+ */
+export async function setDeploymentStatus(
+  deploymentId: string,
+  dbStatus: string,
+  opts?: {
+    extra?: Partial<NewDeployment>;
+    sse?: {
+      status?: BuildSessionState["status"];
+      meta?: {
+        errorCode?: string;
+        errorDetails?: Record<string, unknown>;
+        warningMessage?: string;
+        errorMessage?: string;
+      };
+    };
+  },
+): Promise<void> {
+  await repos.deployment.updateStatus(deploymentId, dbStatus, opts?.extra);
+  sessionManager.updateStatus(
+    deploymentId,
+    opts?.sse?.status ?? (dbStatus as BuildSessionState["status"]),
+    opts?.sse?.meta,
+  );
 }
 
 // ─── Hooks ───────────────────────────────────────────────────────────────────

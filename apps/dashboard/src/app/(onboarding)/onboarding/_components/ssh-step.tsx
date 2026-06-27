@@ -31,8 +31,8 @@ export function SshStep({ state, onUpdate, onNext, onBack }: StepProps) {
   const [serverName, setServerName] = useState(state.ssh?.serverName ?? "");
   const [host, setHost] = useState(state.ssh?.host ?? "");
   const [user, setUser] = useState(state.ssh?.user ?? "root");
-  const [method, setMethod] = useState<"password" | "key">(
-    (state.ssh?.method as "password" | "key") ?? "password",
+  const [method, setMethod] = useState<"password" | "key" | "agent">(
+    (state.ssh?.method as "password" | "key" | "agent") ?? "password",
   );
   const [password, setPassword] = useState(state.ssh?.password ?? "");
   const [keyPath, setKeyPath] = useState(state.ssh?.keyPath ?? "");
@@ -152,7 +152,23 @@ export function SshStep({ state, onUpdate, onNext, onBack }: StepProps) {
           >
             SSH Key
           </button>
+          <button
+            type="button"
+            className={`ob-auth-tab${method === "agent" ? " active" : ""}`}
+            onClick={() => { setMethod("agent"); setError(null); }}
+          >
+            Agent
+          </button>
         </div>
+
+        {/* Agent panel */}
+        {method === "agent" && (
+          <p className="ob-auth-hint">
+            Connects using this machine&apos;s SSH agent — like VSCode, no
+            password or key needed. The host running Openship must already have
+            access to this server (a key loaded in its ssh-agent).
+          </p>
+        )}
 
         {/* Password panel */}
         {method === "password" && (

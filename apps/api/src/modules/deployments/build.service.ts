@@ -30,6 +30,11 @@ import type {
   LogEntry,
   ResourceConfig,
 } from "@repo/adapters";
+import {
+  resolveCloudResourceConfig,
+  type CloudResourceTier,
+  type CloudResourceCustom,
+} from "./cloud-resources";
 import { platform } from "../../lib/controller-helpers";
 import { encrypt } from "../../lib/encryption";
 import {
@@ -197,6 +202,10 @@ export interface BuildAccessInput {
   runtimeMode?: "bare" | "docker";
   serviceDeploymentMode?: "services" | "single";
   services?: DeployableService[];
+  /** Openship Cloud resource tier picked in the UI (server-backed cloud deploys only). */
+  cloudResourceTier?: CloudResourceTier;
+  /** Custom CPU/RAM/disk, used only when cloudResourceTier === "custom". */
+  cloudResourceCustom?: CloudResourceCustom;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -474,6 +483,8 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
     runtimeMode,
     serviceDeploymentMode,
     services,
+    cloudResourceTier,
+    cloudResourceCustom,
   } = input;
 
   const project = await repos.project.findById(projectId);
@@ -544,6 +555,17 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
   }
   if (runtimeMode) {
     snapshot.runtimeMode = runtimeMode;
+  }
+
+  // Openship Cloud resource tier — only a SERVER-BACKED cloud (Oblien)
+  // deploy provisions a workspace sized by these resources. Static (Pages)
+  // deploys have no workspace to size, and non-cloud targets keep the
+  // project's own resource config, so the picker is ignored for them.
+  // The resolved ResourceConfig rides the existing `snapshot.resources`
+  // plumbing → prodResources → runtime.deploy / ensureServiceGroup →
+  // cloud.ts (cpus/memory_mb/disk_size_mb).
+  if (snapshot.deployTarget === "cloud" && snapshot.hasServer && cloudResourceTier) {
+    snapshot.resources = resolveCloudResourceConfig(cloudResourceTier, cloudResourceCustom);
   }
 
   // ── Preflight: validate config + domain before creating any resources ──

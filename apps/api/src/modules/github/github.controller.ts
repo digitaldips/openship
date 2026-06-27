@@ -15,8 +15,8 @@ import { env } from "../../config/env";
 import { auth } from "../../lib/auth";
 import { audit, auditContextFrom } from "../../lib/audit";
 import * as githubAuth from "./github.auth";
-import * as localAuth from "./github.local-auth";
 import * as githubService from "./github.service";
+import { createGitHubSource } from "./sources";
 import { filterAllowedRepos, filterAllowedAccounts } from "./github-access";
 import { getRequestContext } from "../../lib/request-context";
 
@@ -57,16 +57,30 @@ function getSetCookieHeaders(headers: Headers): string[] {
 // ─── Status / Connection ─────────────────────────────────────────────────────
 
 /**
- * GET /github/status — canonical connection state for the current user.
- * The wire shape is `{ state: GitHubConnectionState }` — see github.types.ts.
- * No `mode` field: the global platform mode is `env.CLOUD_MODE` (backend) /
- * `selfHosted` (frontend's PlatformContext). This endpoint only carries
- * GitHub-specific state.
+ * GET /github/status — connection state for the current user, PLUS the App's
+ * installation accounts. Wire shape: `{ state: GitHubConnectionState, accounts:
+ * MappedAccount[] }`. This is the Settings card's data source — it probes the
+ * cloud for the real App status + installs, decoupled from the gh-first
+ * library home (getUserHome). No `mode` field: the global platform mode is
+ * `env.CLOUD_MODE` (backend) / `selfHosted` (frontend's PlatformContext).
  */
 export async function getStatus(c: Context) {
   const ctx = getRequestContext(c);
-  const state = await githubAuth.getGitHubConnectionState(ctx);
-  return c.json({ state });
+  const source = await createGitHubSource(ctx);
+  // The Settings card owns the "Install App" affordance, so the install URL is
+  // resolved HERE (cloud round-trip in cloud-app mode), alongside the real App
+  // status + installs. Members still only see App accounts they're granted.
+  const [{ state, accounts }, install] = await Promise.all([
+    source.getConnectionStatus(),
+    source.resolveInstallUrl(),
+  ]);
+  const allowedAccounts = await filterAllowedAccounts(ctx, accounts, (a) => a.login);
+  return c.json({
+    state,
+    accounts: allowedAccounts,
+    installUrl: install.url,
+    cloudUnreachable: install.cloudUnreachable ?? false,
+  });
 }
 
 /**
@@ -77,12 +91,23 @@ export async function getStatus(c: Context) {
  */
 export async function getHome(c: Context) {
   const ctx = getRequestContext(c);
-  const data = await githubService.getUserHome(ctx);
-  // Per-request resolution — in cloud-app mode this round-trips through
-  // api.openship.io for a state-bound URL so the install can be
-  // attributed back to ctx.organizationId; otherwise returns the static
-  // GitHub install URL.
-  const { url: installUrl, cloudUnreachable } = await githubAuth.resolveInstallUrl(ctx);
+  const source = await createGitHubSource(ctx);
+  const data = await source.getHome();
+
+  // installUrl is an App concept that resolveInstallUrl resolves via the SaaS
+  // in cloud-app mode. The gh-first library doesn't need it — the "Install
+  // App" affordance lives on the Settings card, which gets it from
+  // GET /github/status. So when gh drives the library (state.primary ===
+  // "gh-cli") we SKIP the cloud probe entirely, keeping a plain browse 100%
+  // local. Only the App/cloud library path resolves it (as before).
+  let installUrl = "";
+  let cloudUnreachable = false;
+  if (data.state.primary !== "gh-cli") {
+    const r = await source.resolveInstallUrl();
+    installUrl = r.url;
+    cloudUnreachable = r.cloudUnreachable ?? false;
+  }
+
   // Default-deny GitHub visibility: a member sees only the repos/accounts
   // the owner granted them. Owner / all-GitHub grant → unchanged (the
   // filters short-circuit). This is the "list" op of the access layer.
@@ -97,7 +122,7 @@ export async function getHome(c: Context) {
     installUrl,
     // cloud-app mode + SaaS down: the card shows "Openship Cloud
     // unreachable" instead of a dead install button (installUrl is "").
-    cloudUnreachable: cloudUnreachable ?? false,
+    cloudUnreachable,
   });
 }
 
@@ -319,7 +344,9 @@ export async function connect(c: Context) {
     }
     // Has CLIENT_ID → start device flow
     try {
-      const verification = await localAuth.startDeviceFlow(userId);
+      // Dynamic import: gh device flow is self-hosted only; never on the SaaS.
+      const { startDeviceFlow } = await import("./github.local-auth");
+      const verification = await startDeviceFlow(userId);
       return c.json({
         connected: false,
         flow: "device_code" as const,
@@ -436,7 +463,8 @@ export async function connectRedirect(c: Context) {
  *  Gated by `localOnly` middleware - never reaches this handler in cloud modes.
  */
 export async function getLocalStatus(c: Context) {
-  const localStatus = await localAuth.getLocalGhStatus();
+  const { getLocalGhStatus } = await import("./github.local-auth");
+  const localStatus = await getLocalGhStatus();
   return c.json({
     ...localStatus,
     activeMode: githubAuth.getGitHubAuthMode(),
@@ -448,7 +476,8 @@ export async function getLocalStatus(c: Context) {
  */
 export async function pollConnect(c: Context) {
   const ctx = getRequestContext(c);
-  const status = localAuth.getDeviceFlowStatus(ctx.userId);
+  const { getDeviceFlowStatus } = await import("./github.local-auth");
+  const status = getDeviceFlowStatus(ctx.userId);
   if (!status) {
     return c.json({ status: "none" as const }, 404);
   }
@@ -496,22 +525,22 @@ export async function disconnect(c: Context) {
 
 /** GET /github/repos - List repos for an owner from the active GitHub source.
  *  Source resolution (App installation / gh CLI / user token) lives in ONE
- *  place — githubService.listReposForOwner — so this and listOrgRepos can't
- *  drift. null = no usable GitHub source → 400. */
+ *  place — the GitHubSource adapter (createGitHubSource) — so this and
+ *  listOrgRepos can't drift. null = no usable GitHub source → 400. */
 export async function listRepos(c: Context) {
   const ctx = getRequestContext(c);
   const owner = c.req.query("owner");
-  const repos = await githubService.listReposForOwner(ctx, owner || undefined);
+  const repos = await (await createGitHubSource(ctx)).listReposForOwner(owner || undefined);
   if (repos === null) return c.json({ error: "Not connected to GitHub" }, 400);
   return c.json({ data: await filterAllowedRepos(ctx, repos, repoKey) });
 }
 
 /** GET /github/orgs/:org/repos - List repos for an organisation.
- *  Same single-source resolver as listRepos (githubService.listReposForOwner). */
+ *  Same GitHubSource adapter as listRepos. */
 export async function listOrgRepos(c: Context) {
   const ctx = getRequestContext(c);
   const org = param(c, "org");
-  const repos = await githubService.listReposForOwner(ctx, org);
+  const repos = await (await createGitHubSource(ctx)).listReposForOwner(org);
   if (repos === null) return c.json({ error: "Not connected to GitHub" }, 400);
   return c.json({ data: await filterAllowedRepos(ctx, repos, repoKey) });
 }

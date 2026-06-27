@@ -1,6 +1,7 @@
 import { api } from "./client";
 import { endpoints } from "./endpoints";
 import type { StackId } from "@repo/core";
+import type { CloudResourceTier, CloudResourceCustom } from "@/context/deployment/types";
 
 export type PrepareProjectSource =
   | { source?: "github"; owner: string; repo: string; branch?: string; force?: string | boolean }
@@ -198,6 +199,8 @@ export const deployApi = {
       customDomain?: string;
       domainType?: "free" | "custom";
     }>;
+    cloudResourceTier?: CloudResourceTier;
+    cloudResourceCustom?: CloudResourceCustom;
   }) =>
     api.post<any>(endpoints.deploy.buildAccess, payload),
 

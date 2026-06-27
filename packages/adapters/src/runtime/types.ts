@@ -59,7 +59,16 @@ export type RuntimeCapability =
    * workspace terminal, etc. Powers the in-dashboard service
    * terminal — see modules/service-terminal/.
    */
-  | "serviceShell";
+  | "serviceShell"
+  /**
+   * Runtime can enumerate every container it owns for a given project
+   * by label, independent of DB tracking. Powers the project-deletion
+   * orphan sweep: a container started by a deploy that later failed (or
+   * whose row was lost) has no DB record, but it still carries the
+   * `openship.project=<id>` label — so teardown can reclaim it. Docker
+   * implements this; Bare/Cloud don't (no label-queryable container set).
+   */
+  | "projectContainerSweep";
 
 // ─── Interface ───────────────────────────────────────────────────────────────
 
@@ -108,6 +117,14 @@ export interface RuntimeAdapter {
 
   /** Permanently remove a container/process and its resources */
   destroy(containerId: string): Promise<void>;
+
+  /**
+   * List the IDs of every container this runtime owns for `projectId`,
+   * matched by the `openship.project` label (includes stopped ones).
+   * Used by project teardown to reclaim orphans with no DB row. Only
+   * present when `supports("projectContainerSweep")`.
+   */
+  listProjectContainerIds?(projectId: string): Promise<string[]>;
 
   // ── Observability ────────────────────────────────────────────────────
 

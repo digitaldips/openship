@@ -210,66 +210,97 @@ export async function teardownProject(
     return finalize(steps, false);
   }
 
-  let project: Project | undefined;
+  // Everything past the claim runs UNDER the lock. Release it in `finally`
+  // on ANY exit — throw, early return, or normal completion — UNLESS the row
+  // was deleted (then there's no row to unlock). This is what stops a thrown
+  // step from leaving the project permanently stuck at "Another delete is
+  // already running". (A true infinite hang is bounded by the step timeouts;
+  // a process death mid-teardown is recovered by clearStaleDeletions at boot.)
+  let rowDeleted = false;
   try {
-    project = await repos.project.findById(projectId);
-  } catch (err) {
-    push({ step: "load_project", status: "failed", error: safeErrorMessage(err) });
+    let project: Project | undefined;
+    try {
+      project = await repos.project.findById(projectId);
+    } catch (err) {
+      push({ step: "load_project", status: "failed", error: safeErrorMessage(err) });
+    }
+
+    if (!project) {
+      push({
+        step: "load_project",
+        status: "failed",
+        error: "Project not found",
+      });
+      return finalize(steps, false, "already_deleted");
+    }
+
+    // Belt-and-suspenders org check. The route's `assertResourceInOrg`
+    // should already have refused before we got here, but if a future
+    // caller forgets we MUST NOT destroy a project belonging to another
+    // org. Mismatch returns a typed rejection so the controller can
+    // surface PROJECT_ORG_MISMATCH; we treat it like a load failure.
+    if (project.organizationId !== ctx.organizationId) {
+      push({
+        step: "load_project",
+        status: "failed",
+        error: "PROJECT_ORG_MISMATCH",
+      });
+      return finalize(steps, false, "org_mismatch");
+    }
+
+    // ── Step 1: Cancel in-flight work (force=true only). ────────────────
+    if (opts.force) {
+      await stepCancelInFlight(projectId, ctx.userId, push);
+    } else {
+      push({ step: "cancel_in_flight", status: "skipped", details: "force=false" });
+    }
+
+    // ── Step 2: Unregister GitHub webhook. ───────────────────────────────
+    await stepDeleteWebhook(ctx, project, push);
+
+    // ── Step 3: Tear down runtime + edge + pages + routes + volumes via
+    //   the existing manifest executor. Cloud workspaces destroy through
+    //   the same path because the cloud runtime adapter implements destroy().
+    await stepRuntimeCleanup(project, opts.wipeVolumes ?? false, push);
+
+    // ── Step 4: Webmail filesystem + mail-state. ─────────────────────────
+    await stepWebmailTeardown(project, push);
+
+    // ── ATOMICITY GATE: never drop the DB row while the SOURCE is dirty. ──
+    // If runtime cleanup (containers / images / volumes / cloud workspace /
+    // routes) or webmail teardown FAILED, KEEP the project row so the leaked
+    // resources still have a record to retry against. The `finally` below
+    // releases the lock (rowDeleted stays false), so the next delete attempt
+    // re-runs cleanup. The returned result carries the failed steps
+    // (finalize → ok:false, unrecoverable) so the UI shows what blocked it.
+    // GitHub-webhook unregister is best-effort (external state, not a host
+    // resource leak) and deliberately does NOT gate the delete.
+    const sourceClean = steps.every(
+      (s) =>
+        (s.step !== "runtime_cleanup" && s.step !== "webmail") ||
+        s.status === "ok" ||
+        s.status === "skipped",
+    );
+    if (!sourceClean) {
+      push({
+        step: "delete_db_row",
+        status: "skipped",
+        details: "kept: source cleanup incomplete — retry once the runtime is reachable",
+      });
+      return finalize(steps, false);
+    }
+
+    // ── Step 5: Drop the DB row. FK CASCADE on project.id sweeps
+    //   deployment, service, env_var, domain, backup_policy.
+    rowDeleted = await stepDeleteRow(projectId, project.appId, push);
+
+    return finalize(steps, rowDeleted);
+  } finally {
+    // Lock released on every non-deleting exit so a retry is always possible.
+    if (!rowDeleted) {
+      await repos.project.clearDeletionInProgress(projectId).catch(() => {});
+    }
   }
-
-  if (!project) {
-    push({
-      step: "load_project",
-      status: "failed",
-      error: "Project not found",
-    });
-    await repos.project.clearDeletionInProgress(projectId).catch(() => {});
-    return finalize(steps, false, "already_deleted");
-  }
-
-  // Belt-and-suspenders org check. The route's `assertResourceInOrg`
-  // should already have refused before we got here, but if a future
-  // caller forgets we MUST NOT destroy a project belonging to another
-  // org. Mismatch returns a typed rejection so the controller can
-  // surface PROJECT_ORG_MISMATCH; we treat it like a load failure.
-  if (project.organizationId !== ctx.organizationId) {
-    push({
-      step: "load_project",
-      status: "failed",
-      error: "PROJECT_ORG_MISMATCH",
-    });
-    await repos.project.clearDeletionInProgress(projectId).catch(() => {});
-    return finalize(steps, false, "org_mismatch");
-  }
-
-  // ── Step 1: Cancel in-flight work (force=true only). ────────────────
-  if (opts.force) {
-    await stepCancelInFlight(projectId, ctx.userId, push);
-  } else {
-    push({ step: "cancel_in_flight", status: "skipped", details: "force=false" });
-  }
-
-  // ── Step 2: Unregister GitHub webhook. ───────────────────────────────
-  await stepDeleteWebhook(ctx, project, push);
-
-  // ── Step 3: Tear down runtime + edge + pages + routes + volumes via
-  //   the existing manifest executor. Cloud workspaces destroy through
-  //   the same path because the cloud runtime adapter implements destroy().
-  await stepRuntimeCleanup(project, opts.wipeVolumes ?? false, push);
-
-  // ── Step 4: Webmail filesystem + mail-state. ─────────────────────────
-  await stepWebmailTeardown(project, push);
-
-  // ── Step 5: Drop the DB row. FK CASCADE on project.id sweeps
-  //   deployment, service, env_var, domain, backup_policy.
-  const rowDeleted = await stepDeleteRow(projectId, project.appId, push);
-
-  // If row delete failed, release the lock — the user can retry.
-  if (!rowDeleted) {
-    await repos.project.clearDeletionInProgress(projectId).catch(() => {});
-  }
-
-  return finalize(steps, rowDeleted);
 }
 
 function finalize(

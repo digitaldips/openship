@@ -22,8 +22,11 @@ import { safeErrorMessage } from "@repo/core";
 import { env } from "../../config/env";
 import { auth } from "../../lib/auth";
 import { cacheStore } from "../../lib/cache-store";
-import { getLocalGhStatus, getLocalGhToken } from "./github.local-auth";
+// gh-CLI (github.local-auth) is imported DYNAMICALLY at its two self-hosted
+// call sites (getUserStatus "cli" branch, getGitHubConnectionState gh probe)
+// so the gh module never loads in CLOUD_MODE (the SaaS). See those sites.
 import { ghFetch } from "./github.http";
+import { mapAccounts } from "./sources/mappers";
 import type { RequestContext } from "../../lib/request-context";
 import { resolveOrgOwner } from "../../lib/org-actor";
 import type {
@@ -520,12 +523,36 @@ export interface GitHubFetchOptions {
 /**
  * Make an authenticated GitHub API request on behalf of a user.
  *
- * Resolves the token via `tokenFor(ctx, "local", ...)` which owns the
- * full PAT → installation → OAuth priority chain. Appends query params
- * for GET requests, sends JSON body for others.
+ * Token source follows FLOW × MODE:
+ *   - A local READ (GET) goes gh-FIRST when a local gh token exists. A GET on
+ *     the API host is a local read — the response never leaves this host — so
+ *     it uses the gh token DIRECTLY, ungated, exactly like the gh-CLI listing
+ *     path. tokenFor's gh-cli OPERATOR gate (HIGH #7) only guards token-
+ *     SHIPPING to remote build workers, NOT local reads, so we deliberately
+ *     bypass it here. getLocalGhToken self-guards to null in CLOUD_MODE, so on
+ *     the SaaS this falls straight through to tokenFor (the App).
+ *   - Everything else (writes: check-runs/webhooks, or no local gh) resolves
+ *     via `tokenFor(ctx, "local", ...)` — PAT → App installation → OAuth.
+ *     Check-runs MUST be the App, so writes never go gh-first.
+ *
+ * Appends query params for GET requests, sends JSON body for others.
  */
 export async function githubFetch<T = unknown>(opts: GitHubFetchOptions): Promise<T> {
   const method = opts.method ?? "GET";
+
+  // gh-first for local reads.
+  if (method === "GET") {
+    const { getLocalGhToken } = await import("./github.local-auth");
+    const ghToken = await getLocalGhToken();
+    if (ghToken) {
+      return ghFetch<T>(ghToken, {
+        url: opts.url,
+        method,
+        params: opts.params,
+        headers: opts.headers,
+      });
+    }
+  }
 
   const { tokenFor } = await import("./github.token");
   const result = await tokenFor(opts.ctx, "local", {
@@ -608,6 +635,9 @@ export async function getUserStatus(userId: string) {
       const { isGithubCliDisabled } = await import("../settings/settings.service");
       const cliDisabled = await isGithubCliDisabled(userId);
       if (cliDisabled) break;
+      // Dynamic import: the gh module loads ONLY on this self-hosted "cli"
+      // branch — never on the SaaS (CLOUD_MODE resolves mode "app", never "cli").
+      const { getLocalGhToken } = await import("./github.local-auth");
       token = await getLocalGhToken();
       tokenSource = "cli";
       break;
@@ -761,6 +791,8 @@ export async function getGitHubConnectionState(
   let cliLogin: string | undefined;
   let cliAvatar: string | undefined;
   if (onSelfHosted) {
+    // Dynamic import: gh probed ONLY when self-hosted; never loaded on the SaaS.
+    const { getLocalGhStatus } = await import("./github.local-auth");
     const localStatus = await getLocalGhStatus();
     if (localStatus.available) {
       cliAvailable = true;
@@ -917,17 +949,8 @@ function storedAccountAvatarUrl(owner: string, providerOwnerId?: string | null):
   return `https://github.com/${encodeURIComponent(owner)}.png`;
 }
 
-/**
- * Map raw installation data to a clean account summary.
- */
-export function mapAccounts(installations: GitHubInstallation[]): MappedAccount[] {
-  return installations.map((i) => ({
-    login: i.account.login,
-    id: i.account.id,
-    avatar_url: i.account.avatar_url,
-    type: i.account.type,
-  }));
-}
+// Pure mapper lives in ./sources/mappers; re-exported for back-compat.
+export { mapAccounts };
 
 // ─── Connect / Disconnect ────────────────────────────────────────────────────
 

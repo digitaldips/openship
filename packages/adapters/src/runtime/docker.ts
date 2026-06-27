@@ -216,6 +216,7 @@ export class DockerRuntime implements RuntimeAdapter {
     "containerIp",
     "rollback",
     "serviceShell",
+    "projectContainerSweep",
   ]);
 
   /** Underlying dockerode instance - exposed for advanced usage */
@@ -884,6 +885,21 @@ export class DockerRuntime implements RuntimeAdapter {
       // anything else (permission denied, daemon down, dependent state).
       if (!isDockerNotFoundError(err)) throw err;
     }
+  }
+
+  /**
+   * Every container (running OR stopped) labeled for this project. Lets
+   * project teardown reclaim orphans that have no DB row — e.g. a deploy
+   * that started a container then failed during routing, or rows lost to
+   * a crash. The `openship.project` label is stamped at create time
+   * (see `labels()`), so this is authoritative for THIS docker host.
+   */
+  async listProjectContainerIds(projectId: string): Promise<string[]> {
+    const containers = await this.docker.listContainers({
+      all: true,
+      filters: { label: [`openship.project=${projectId}`] },
+    });
+    return containers.map((c) => c.Id);
   }
 
   // ── Rollback primitives ──────────────────────────────────────────────

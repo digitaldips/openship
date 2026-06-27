@@ -11,6 +11,7 @@ import { sshManager } from "../../lib/ssh-manager";
 import { repos } from "@repo/db";
 import * as analyticsService from "./analytics.service";
 import { fetchMgmt } from "../../lib/project-analytics";
+import { scrapeServerIfStale } from "../system/analytics-scraper";
 import type { TAnalyticsQuery, TUsageQuery, TUsageStreamQuery } from "./analytics.schema";
 
 // ─── Request analytics ───────────────────────────────────────────────────────
@@ -28,6 +29,18 @@ export async function periods(c: Context) {
   const ctx = getRequestContext(c);
   const { projectId, from, to } = c.req.query() as unknown as TAnalyticsQuery;
   const data = await analyticsService.getAnalyticsPeriods(ctx, projectId, from, to);
+  return c.json({ data });
+}
+
+/**
+ * GET /analytics/overview - summary + periods together, from ONE underlying
+ * traffic fetch. The dashboard reads this so a project view makes a single
+ * cloud round-trip instead of two (separate /summary + /periods).
+ */
+export async function overview(c: Context) {
+  const ctx = getRequestContext(c);
+  const { projectId, from, to } = c.req.query() as unknown as TAnalyticsQuery;
+  const data = await analyticsService.getAnalyticsOverview(ctx, projectId, from, to);
   return c.json({ data });
 }
 
@@ -136,6 +149,11 @@ export async function serverAnalytics(c: Context) {
   const domain = c.req.query("domain");
   if (!domain) return c.json({ error: "domain query param is required" }, 400);
 
+  // Viewing analytics IS what drives a scrape — no background interval. Fire
+  // and forget (self-throttled); this read returns current DB rows and the
+  // fresh buckets land for the next read/refresh while the page stays open.
+  void scrapeServerIfStale(serverId);
+
   const now = Math.floor(Date.now() / 60_000);
   const fromParam = c.req.query("from");
   const toParam = c.req.query("to");
@@ -165,6 +183,9 @@ export async function serverGeo(c: Context) {
   const serverId = param(c, "serverId");
   const domain = c.req.query("domain");
   if (!domain) return c.json({ error: "domain query param is required" }, 400);
+
+  // On-demand scrape (self-throttled, deduped with serverAnalytics).
+  void scrapeServerIfStale(serverId);
 
   const day = c.req.query("day") ?? new Date().toISOString().slice(0, 10).replace(/-/g, "");
 

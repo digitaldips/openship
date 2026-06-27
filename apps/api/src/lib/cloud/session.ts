@@ -10,6 +10,7 @@
  */
 import { repos } from "@repo/db";
 import { cacheStore } from "../cache-store";
+import { requestMemo } from "../request-store";
 import { cloudFetch, readCloudJson, resolveOrgCloudUserId } from "./transport";
 import type { CloudAccount, TokenCache } from "./types";
 
@@ -73,7 +74,18 @@ const inflightValidate = new Map<
   Promise<{ connected: boolean; user?: CloudAccount }>
 >();
 
-async function validateCloudSession(
+function validateCloudSession(
+  userId: string,
+): Promise<{ connected: boolean; user?: CloudAccount }> {
+  // Per-request memo FIRST: a single inbound request validates the session
+  // once (a /github/status used to fan out into ~6 /cloud/account calls). The
+  // next request gets a fresh store → still proxies live, never stale across
+  // requests. The inflight single-flight below still collapses concurrent
+  // calls when there's no request store (cron / boot / background jobs).
+  return requestMemo(`cloud-session:${userId}`, () => validateCloudSessionLive(userId));
+}
+
+async function validateCloudSessionLive(
   userId: string,
 ): Promise<{ connected: boolean; user?: CloudAccount }> {
   const existing = inflightValidate.get(userId);

@@ -253,7 +253,7 @@ export const DeployTargetSummary: React.FC<CompactSummaryProps> = ({
         )}
       </div>
       {tierChip}
-      <Pencil className="size-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+      <Pencil className="size-3.5 text-muted-foreground transition-opacity" />
     </button>
   );
 };

@@ -191,6 +191,12 @@ export function GitHubProvider({ children, initialData }: GitHubProviderProps) {
   const refresh = useCallback(async () => {
     if (inflightRefresh.current) return inflightRefresh.current;
     const work = (async () => {
+    // refresh() runs after every connect / disconnect / device-flow completion,
+    // so drop the cached /github/status verdict here — the Settings card and
+    // library App badge will then re-probe the new connection state instead of
+    // serving the stale cached one (covers connect paths that don't go through
+    // the Settings card's own force-refresh).
+    githubApi.invalidateStatus();
     try {
       const res = await githubApi.getUserHome();
       const nextState: GitHubConnectionState = res?.state ?? EMPTY_STATE;

@@ -87,7 +87,7 @@ export default function AddServerPage() {
   const [sshHost, setSshHost] = useState("");
   const [sshPort, setSshPort] = useState("22");
   const [sshUser, setSshUser] = useState("root");
-  const [sshAuthMethod, setSshAuthMethod] = useState<"password" | "key">(
+  const [sshAuthMethod, setSshAuthMethod] = useState<"password" | "key" | "agent">(
     "password",
   );
   const [sshPassword, setSshPassword] = useState("");
@@ -153,7 +153,13 @@ export default function AddServerPage() {
           setSshHost(existing.sshHost);
           setSshPort(String(existing.sshPort ?? 22));
           setSshUser(existing.sshUser ?? "root");
-          setSshAuthMethod(existing.sshAuthMethod === "key" ? "key" : "password");
+          setSshAuthMethod(
+            existing.sshAuthMethod === "key"
+              ? "key"
+              : existing.sshAuthMethod === "agent"
+                ? "agent"
+                : "password",
+          );
           setSshKeyPath(existing.sshKeyPath ?? "");
           setJumpHost(existing.sshJumpHost ?? "");
           setExtraArgs(existing.sshArgs ?? "");
@@ -626,6 +632,18 @@ export default function AddServerPage() {
                       <KeyRound className="size-3.5" />
                       SSH Key
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setSshAuthMethod("agent")}
+                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 text-[13px] font-medium rounded-lg transition-all ${
+                        sshAuthMethod === "agent"
+                          ? "bg-card text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground/70"
+                      }`}
+                    >
+                      <Network className="size-3.5" />
+                      Agent
+                    </button>
                   </div>
 
                   {sshAuthMethod === "password" ? (
@@ -639,6 +657,16 @@ export default function AddServerPage() {
                         autoComplete="off"
                         className={INPUT}
                       />
+                    </div>
+                  ) : sshAuthMethod === "agent" ? (
+                    <div className="flex items-start gap-2.5 rounded-xl border border-border/50 bg-muted/30 px-3.5 py-3">
+                      <Network className="size-4 shrink-0 mt-0.5 text-primary" />
+                      <p className="text-[13px] leading-relaxed text-muted-foreground">
+                        Connects using this machine&apos;s SSH agent — like
+                        VSCode, no password or key needed. The host running
+                        Openship must already have access to this server (a key
+                        loaded in its <span className="text-foreground/80">ssh-agent</span>).
+                      </p>
                     </div>
                   ) : (
                     <div className="space-y-[18px]">

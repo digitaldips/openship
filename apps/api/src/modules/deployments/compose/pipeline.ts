@@ -27,9 +27,9 @@ import {
   cleanupBuildArtifact,
   onFailure,
   onSuccess,
+  setDeploymentStatus,
   type LifecycleContext,
 } from "../deployment-lifecycle";
-import * as sessionManager from "../session-manager";
 import type { DeployableService } from "../../../lib/deployable-service";
 import { internalApiUrl } from "../../../config";
 
@@ -104,10 +104,9 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
   } else {
     logger.log("Build phase complete. Starting project service deployment...\n");
   }
-  await repos.deployment.updateStatus(dep.id, "deploying", {
-    buildDurationMs: composeBuild.durationMs,
+  await setDeploymentStatus(dep.id, "deploying", {
+    extra: { buildDurationMs: composeBuild.durationMs },
   });
-  sessionManager.updateStatus(dep.id, "deploying");
 
   // ── Deploy phase: spin up containers on the shared network ─────────
   const composeResult = await deployComposeServices(project, dep, runtime, logger, {

@@ -53,11 +53,24 @@ export async function renew(
     includeWww,
   });
 
+  // Honest status: a cert was actually issued ONLY if we got an expiry back.
+  // certbot failures throw (caught by the controller, which surfaces the real
+  // ACME error), so reaching here with no expiresAt means a no-op provider or
+  // an unreadable cert — report it as still-provisioning, NOT "renewed", so the
+  // UI doesn't show a green toast over a domain that's still on HTTP.
+  const issued = Boolean(result.expiresAt);
   return {
-    success: true,
+    success: issued,
     domain: hostname,
+    status: issued ? "active" : "provisioning",
     expiresAt: result.expiresAt,
     issuer: result.issuer,
+    ...(issued
+      ? {}
+      : {
+          message:
+            `No certificate was issued for ${hostname} yet. Confirm its DNS points to this server and the domain is reachable over HTTP (port 80), then try again.`,
+        }),
   };
 }
 

@@ -496,6 +496,18 @@ export function useDeploymentBuild(
           config.projectType === "services"
             ? config.serviceDeploymentMode
             : undefined,
+        // Cloud resource tier only matters for a server-backed Oblien deploy.
+        // Static (Pages) deploys and non-cloud targets ignore it.
+        cloudResourceTier:
+          config.deployTarget === "cloud" && config.options.hasServer
+            ? config.cloudResourceTier
+            : undefined,
+        cloudResourceCustom:
+          config.deployTarget === "cloud" &&
+          config.options.hasServer &&
+          config.cloudResourceTier === "custom"
+            ? config.cloudResourceCustom
+            : undefined,
         services: isServiceDeployment
           ? config.services.map((service) => ({
               name: service.name,

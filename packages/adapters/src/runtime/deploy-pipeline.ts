@@ -129,6 +129,11 @@ export async function runDeployPipeline(
 ): Promise<DeployPipelineResult> {
   const { config, previousContainerId, domains, routing, ssl, routeOptions, promptUser } = input;
 
+  // Track the container we activate so a failure DURING/AFTER routing can
+  // report it back to the caller for cleanup — a started-but-unrouted
+  // container must not orphan.
+  let activatedContainerId: string | undefined;
+
   try {
     logger.step("deploy", "running", "Deploying...");
 
@@ -155,6 +160,7 @@ export async function runDeployPipeline(
     // ── Step 2: Activate new deployment ──────────────────────────────
     const onLog: LogCallback = (entry) => logger.callback(entry);
     const { containerId, url } = await env.activate(config, onLog);
+    activatedContainerId = containerId;
 
     if (!containerId) {
       throw new Error("Deploy completed but no container was created");
@@ -207,6 +213,6 @@ export async function runDeployPipeline(
     const errorDetails = err instanceof DeployError ? err.details : undefined;
     logger.step("deploy", "failed", `Deploy failed: ${msg}`);
     logger.log(`\x1b[1;31mDeploy failed: ${msg}\x1b[0m\n`, "error");
-    return { status: "failed", error: msg, errorCode, errorDetails };
+    return { status: "failed", error: msg, errorCode, errorDetails, containerId: activatedContainerId };
   }
 }

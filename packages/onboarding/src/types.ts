@@ -23,7 +23,7 @@ export interface TunnelConfig {
 export interface SshPayload {
   host: string;
   user: string;
-  method: "password" | "key";
+  method: "password" | "key" | "agent";
   serverName?: string;
   password?: string;
   keyPath?: string;

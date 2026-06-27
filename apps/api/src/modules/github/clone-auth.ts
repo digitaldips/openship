@@ -40,12 +40,25 @@ export async function resolveBuildGitToken(opts: {
   };
 
   if (opts.buildStrategy === "local") {
+    // LOCAL build: clone + build run on THIS host, the token never leaves it,
+    // and we're already authenticated via gh — so use the local gh token
+    // DIRECTLY, no SaaS App-token fetch. (Same rule as local READS in
+    // githubFetch: local op → gh.) Falls through to the full resolver chain
+    // (App installation / project PAT / user PAT / OAuth) only when there's no
+    // local gh. getLocalGhToken self-guards to null in CLOUD_MODE.
+    const { getLocalGhToken } = await import("./github.local-auth");
+    const ghToken = await getLocalGhToken();
+    if (ghToken) return ghToken;
+
     const r = await tokenFor(opts.ctx, "local", tokenCtx);
     return r?.token ?? null;
   }
 
-  // Remote — throw if nothing resolvable. requireTokenFor builds an
-  // actionable error message with the right hint per purpose.
+  // SERVER / REMOTE build: the clone/build runs off this host (server's Docker
+  // daemon, cloud workspace), so we fetch the SaaS-minted App installation
+  // token (short-lived, repo-scoped) — gh is REFUSED here (HIGH #7: never ship
+  // the operator's broad token off-host). requireTokenFor throws an actionable
+  // error if nothing is resolvable.
   const r = await requireTokenFor(opts.ctx, "remote", tokenCtx);
   return r.token;
 }

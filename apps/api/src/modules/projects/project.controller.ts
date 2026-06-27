@@ -880,38 +880,41 @@ export async function runtimeLogStream(c: Context) {
 // ─── Server HTTP request logs ────────────────────────────────────────────────
 
 function extractCloudStreamToken(result: unknown): { stream_url: string; token: string } | null {
-  const root = result as Record<string, unknown> | null;
-  const data = (root?.data && typeof root.data === "object" ? root.data : root) as Record<
-    string,
-    unknown
-  > | null;
-  const streamUrl = data?.stream_url ?? data?.streamUrl ?? data?.url;
-  const token = data?.token;
-  return typeof streamUrl === "string" && typeof token === "string"
-    ? { stream_url: streamUrl, token }
-    : null;
+  // The payload nesting DIFFERS by path:
+  //   • admin-direct (Oblien SDK):  { success, data: { stream_url, token, … } }  ← 1 level
+  //   • cloud-proxied (SaaS wraps the SDK response again): { data: { success, data: { stream_url, token } } }  ← 2 levels
+  // So walk down through nested `data`/`result` wrappers until we hit the object
+  // that actually carries stream_url + token, instead of assuming a fixed depth.
+  let node: unknown = result;
+  for (let depth = 0; depth < 4 && node && typeof node === "object"; depth++) {
+    const obj = node as Record<string, unknown>;
+    const streamUrl =
+      obj.stream_url ?? obj.streamUrl ?? obj.url ?? obj.sse_url ?? obj.endpoint;
+    const token =
+      obj.token ?? obj.stream_token ?? obj.streamToken ?? obj.access_token ?? obj.jwt;
+    if (typeof streamUrl === "string" && typeof token === "string") {
+      return { stream_url: streamUrl, token };
+    }
+    node = obj.data ?? obj.result;
+  }
+  return null;
 }
 
 function extractCloudRequestLogs(result: unknown): unknown[] {
-  const root = result as Record<string, unknown> | null;
-  const data = root?.data as unknown;
-  const candidates = [
-    data,
-    root?.requests,
-    root?.logs,
-    root?.items,
-    root?.rows,
-    data && typeof data === "object" ? (data as Record<string, unknown>).requests : undefined,
-    data && typeof data === "object" ? (data as Record<string, unknown>).logs : undefined,
-    data && typeof data === "object" ? (data as Record<string, unknown>).items : undefined,
-    data && typeof data === "object" ? (data as Record<string, unknown>).rows : undefined,
-  ];
-
-  for (const candidate of candidates) {
-    if (Array.isArray(candidate)) return candidate;
+  // Same nesting problem as the stream token: the request array can sit at
+  // result.data (admin-direct) or result.data.data (cloud-proxied). Walk down
+  // nested `data`/`result` wrappers and return the first array found at a known
+  // key or as a bare `data` array.
+  let node: unknown = result;
+  for (let depth = 0; depth < 4 && node && typeof node === "object"; depth++) {
+    const obj = node as Record<string, unknown>;
+    for (const key of ["requests", "logs", "items", "rows"]) {
+      if (Array.isArray(obj[key])) return obj[key] as unknown[];
+    }
+    if (Array.isArray(obj.data)) return obj.data as unknown[];
+    node = obj.data ?? obj.result;
   }
-
-  return [];
+  return Array.isArray(result) ? (result as unknown[]) : [];
 }
 
 /**
@@ -942,19 +945,32 @@ export async function serverLogStreamToken(c: Context) {
     const client = getAdminOblienClient();
     let tokenResult: unknown = null;
 
-    if (client) {
-      try {
-        tokenResult = await client.analytics.streamToken(source.domain);
-      } catch {
-        return c.json({ kind: "self-hosted" as const });
-      }
-    } else {
-      tokenResult = await cloudClient({ organizationId }).analytics.streamToken(source.domain);
+    try {
+      tokenResult = client
+        ? await client.analytics.streamToken(source.domain)
+        : await cloudClient({ organizationId }).analytics.streamToken(source.domain);
+    } catch (err) {
+      // Token mint failed. This is a CLOUD project — do NOT claim "self-hosted"
+      // (that sends the client to /server-logs/stream, which 400s for cloud).
+      // Report "unavailable" so the client shows recent logs without erroring.
+      console.warn(
+        `[server-logs] cloud stream-token mint failed for ${source.domain}: ${safeErrorMessage(err)}`,
+      );
+      return c.json({ kind: "unavailable" as const });
     }
 
     const tokenData = extractCloudStreamToken(tokenResult);
     if (!tokenData) {
-      return c.json({ kind: "self-hosted" as const });
+      // 200 but unparseable shape. Surface the KEYS (never the token value) so a
+      // SaaS response-shape change is diagnosable instead of silently degrading.
+      const rt = (tokenResult ?? {}) as Record<string, unknown>;
+      const inner = (rt.data ?? rt.result ?? rt) as Record<string, unknown> | null;
+      console.warn(
+        `[server-logs] cloud stream-token unparseable for ${source.domain}; ` +
+          `top keys=[${Object.keys(rt).join(",")}] ` +
+          `inner keys=[${inner && typeof inner === "object" ? Object.keys(inner).join(",") : ""}]`,
+      );
+      return c.json({ kind: "unavailable" as const });
     }
     return c.json({ kind: "cloud" as const, url: tokenData.stream_url, token: tokenData.token });
   }

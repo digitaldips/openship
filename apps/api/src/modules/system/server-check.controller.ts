@@ -163,15 +163,23 @@ async function buildEphemeralExecutor(c: Context) {
     return c.json({ ok: false, message: "SSH host is required" }, 400);
   }
 
-  const config = await buildSshConfig({
-    sshHost: host,
-    sshPort: body.sshPort ? Number(body.sshPort) : null,
-    sshUser: (body.sshUser as string) || null,
-    sshAuthMethod: body.sshAuthMethod as string,
-    sshPassword: body.sshPassword as string ?? null,
-    sshKeyPath: body.sshKeyPath as string ?? null,
-    sshKeyPassphrase: body.sshKeyPassphrase as string ?? null,
-  });
+  // buildSshConfig also handles "agent" auth (uses the host's SSH_AUTH_SOCK,
+  // like VSCode) and THROWS a clear message when agent is selected but no
+  // agent is available — surface that as a clean 400 instead of a 500.
+  let config;
+  try {
+    config = await buildSshConfig({
+      sshHost: host,
+      sshPort: body.sshPort ? Number(body.sshPort) : null,
+      sshUser: (body.sshUser as string) || null,
+      sshAuthMethod: body.sshAuthMethod as string,
+      sshPassword: body.sshPassword as string ?? null,
+      sshKeyPath: body.sshKeyPath as string ?? null,
+      sshKeyPassphrase: body.sshKeyPassphrase as string ?? null,
+    });
+  } catch (err) {
+    return c.json({ ok: false, message: safeErrorMessage(err) }, 400);
+  }
 
   if (!config) {
     return c.json({ ok: false, message: "Invalid auth configuration" }, 400);

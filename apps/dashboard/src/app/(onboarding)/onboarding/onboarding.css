@@ -432,6 +432,17 @@
   color: var(--th-text-body);
 }
 
+.ob-auth-hint {
+  margin-top: 14px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--th-text-muted);
+  background: var(--th-sf-04);
+  border: 1px solid var(--th-border-soft, rgba(255,255,255,.08));
+  border-radius: 10px;
+}
+
 /* Input with inline button */
 .ob-input-with-btn {
   display: flex;

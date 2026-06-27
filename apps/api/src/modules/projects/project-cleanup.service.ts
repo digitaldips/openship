@@ -15,14 +15,41 @@ import { repos, type Project, type Deployment } from "@repo/db";
 import { DockerRuntime, type RuntimeAdapter } from "@repo/adapters";
 import { safeErrorMessage } from "@repo/core";
 import { platform } from "../../lib/controller-helpers";
-import { resolveDeploymentRuntime } from "../../lib/deployment-runtime";
+import {
+  resolveDeploymentRuntime,
+  resolveDeploymentPlatform,
+  type DeploymentMeta,
+} from "../../lib/deployment-runtime";
+import { resolveOrgCloudUserId } from "../../lib/cloud/transport";
 import { buildServiceRouteDomain } from "../../lib/routing-domains";
+
+/** Hard ceiling on a docker-over-SSH volume inspect during manifest/preview.
+ *  These calls `.catch(() => [])` on ERROR, but a half-open SSH socket never
+ *  rejects — it hangs. Without a timeout the deletion-preview handler (and the
+ *  "Scanning attached services and volumes…" UI) loads forever. */
+const INSPECT_TIMEOUT_MS = 10_000;
 
 // ─── Resource Manifest ───────────────────────────────────────────────────────
 
 export interface CleanupResource {
-  type: "container" | "image" | "artifact" | "route" | "volume" | "network";
-  /** Runtime-specific identifier (container ID, image ref, hostname, volume name, network slug). */
+  type:
+    | "container"
+    | "image"
+    | "artifact"
+    | "route"
+    | "volume"
+    | "network"
+    | "cloud_workspace"
+    /**
+     * A resource we KNOW exists but can't reach right now (cloud down, or a
+     * server that still exists but is transiently unreachable). Its destroy
+     * always throws, so runtime_cleanup is marked failed and the teardown's
+     * atomicity gate keeps the project row — never orphan a live resource.
+     * Distinct from "permanently gone" (server removed), which is skipped so
+     * deletion can proceed.
+     */
+    | "unreachable";
+  /** Runtime-specific identifier (container ID, image ref, hostname, volume name, network slug, cloud workspace id). */
   ref: string;
   /** Label for logging */
   label: string;
@@ -108,7 +135,11 @@ export async function collectProjectManifest(
     labelPrefix: string,
   ) => {
     if (!wipeVolumes || !(runtime instanceof DockerRuntime)) return;
-    const names = await runtime.inspectNamedVolumes(containerId).catch(() => [] as string[]);
+    const names = await withTimeout(
+      runtime.inspectNamedVolumes(containerId),
+      INSPECT_TIMEOUT_MS,
+      `inspect volumes ${labelPrefix}`,
+    ).catch(() => [] as string[]);
     for (const name of names) {
       if (seenVolumes.has(name)) continue;
       seenVolumes.add(name);
@@ -129,8 +160,34 @@ export async function collectProjectManifest(
     let runtime: RuntimeAdapter;
     try {
       ({ runtime } = await resolveDeploymentRuntime(dep));
-    } catch {
-      // Can't resolve runtime (e.g. server deleted) - skip runtime resources
+    } catch (err) {
+      // Couldn't resolve the runtime. Two very different cases:
+      //   • The target server was REMOVED from the org → its containers are
+      //     unreachable forever; skip so the project can still be deleted
+      //     (blocking forever would strand the row — the original lock pain).
+      //   • The server still EXISTS but is transiently unreachable (SSH down)
+      //     and this deployment has a live container → mark it unreachable so
+      //     the atomicity gate keeps the row; never orphan a live container.
+      const meta = (dep.meta ?? {}) as DeploymentMeta;
+      const serverStillExists = meta.serverId
+        ? Boolean(
+            await repos.server
+              .getInOrganization(meta.serverId, dep.organizationId)
+              .catch(() => null),
+          )
+        : false;
+      if (dep.containerId && serverStillExists) {
+        resources.push({
+          type: "unreachable",
+          ref: dep.containerId,
+          label: `deployment container ${dep.containerId.slice(0, 12)} (server unreachable)`,
+          runtime: null,
+        });
+      } else {
+        console.warn(
+          `[cleanup] skipping unresolvable deployment ${dep.id} (server gone or never deployed): ${safeErrorMessage(err)}`,
+        );
+      }
       continue;
     }
 
@@ -169,6 +226,102 @@ export async function collectProjectManifest(
     // Bare runtime artifacts (release dirs stored as containerId paths)
     if (dep.containerId?.includes("/") && !(runtime instanceof DockerRuntime)) {
       // Already tracked as "container" above - bare destroy() handles path removal
+    }
+  }
+
+  // ── Orphan container sweep (label-based, authoritative per host) ───
+  // Reclaim containers labeled `openship.project=<id>` that NO DB row
+  // references — started by a deploy that then failed during routing, or
+  // whose row was lost to a crash. This is how leaked containers ("3 for
+  // one project") get cleaned, even retroactively. Sweep every docker
+  // runtime the deployments resolved to PLUS the local platform runtime
+  // (so a single-host install is swept even when no deployment row
+  // resolved). De-duped via pushContainer's seenContainers; best-effort +
+  // bounded (SSH can hang). A separate set keeps the networks block above
+  // from gaining a spurious local-host network resource.
+  const sweepRuntimes = new Set<DockerRuntime>(dockerRuntimes);
+  const localRuntime = platform().runtime;
+  if (localRuntime instanceof DockerRuntime) sweepRuntimes.add(localRuntime);
+  for (const docker of sweepRuntimes) {
+    if (!docker.supports("projectContainerSweep") || !docker.listProjectContainerIds) continue;
+    const ids = await withTimeout(
+      docker.listProjectContainerIds(project.id),
+      INSPECT_TIMEOUT_MS,
+      `sweep containers ${project.id}`,
+    ).catch(() => [] as string[]);
+    for (const id of ids) {
+      // Enumerate volumes BEFORE the container is destroyed (same reason as
+      // the DB-tracked path) so a wipeVolumes teardown still sees the mounts.
+      await pushVolumesForContainer(id, docker, "orphan");
+      pushContainer(id, docker, "orphan container");
+    }
+  }
+
+  // ── Cloud workspace (the canonical Oblien binding) ────────────────
+  // `project.cloudWorkspaceId` is the CURRENT workspace this project
+  // deploys to. Deployment rows may reference OLD workspaces (re-provisioned)
+  // or none at all (provision succeeded but no deploy row reached ready),
+  // and the per-deployment runtime resolution above may have been skipped
+  // (server gone). Enumerate it explicitly so deleting the project always
+  // tears the workspace down on Oblien — fixes "deleted locally but still
+  // live on Openship Cloud". De-duped against any deployment container that
+  // already covers it.
+  if (project.cloudWorkspaceId && !seenContainers.has(project.cloudWorkspaceId)) {
+    try {
+      // BOUNDED: this resolution mints a cloud token (cloudFetch, no native
+      // timeout). Without withTimeout a cloud-side hang would stall manifest
+      // collection while the teardown holds the deletion lock — the same hang
+      // class the SSH paths above are bounded against.
+      const { platform: cloudPlatform } = await withTimeout(
+        resolveDeploymentPlatform(
+          { deployTarget: "cloud", workspaceId: project.cloudWorkspaceId },
+          { organizationId: project.organizationId },
+        ),
+        INSPECT_TIMEOUT_MS,
+        `resolve cloud workspace ${project.cloudWorkspaceId}`,
+      );
+      // Guard against a non-cloud base resolving to local/server (a pure
+      // self-hosted project never has a cloud workspace anyway).
+      if (cloudPlatform.runtime.name === "cloud") {
+        seenContainers.add(project.cloudWorkspaceId);
+        resources.push({
+          type: "cloud_workspace",
+          ref: project.cloudWorkspaceId,
+          label: `cloud workspace ${project.cloudWorkspaceId}`,
+          runtime: cloudPlatform.runtime,
+        });
+      } else {
+        // Don't silently drop it — an orphaned workspace should be visible.
+        console.warn(
+          `[cleanup] cloud workspace ${project.cloudWorkspaceId} resolved to non-cloud runtime "${cloudPlatform.runtime.name}" — skipped`,
+        );
+      }
+    } catch (err) {
+      // Two very different failures land here — distinguish them like the
+      // gone-server branch above:
+      //   • PERMANENT (org has no Openship Cloud link → owner unlinked/never
+      //     linked): we can never reach this workspace from here, so blocking
+      //     the delete forever helps nobody. Skip + warn so the project stays
+      //     deletable (the workspace may remain on Oblien; re-link to clean it).
+      //   • TRANSIENT (link exists but cloud/token-mint is down, or we timed
+      //     out above): mark unreachable so the atomicity gate KEEPS the row and
+      //     the user retries once Cloud is reachable. On an inconclusive link
+      //     check we also keep (never orphan on uncertainty).
+      const linkUserId = await resolveOrgCloudUserId(project.organizationId).catch(
+        () => "unknown" as const,
+      );
+      if (linkUserId === null) {
+        console.warn(
+          `[cleanup] cloud workspace ${project.cloudWorkspaceId} skipped — org ${project.organizationId} has no Openship Cloud link (${safeErrorMessage(err)}); workspace may remain on Oblien. Re-link to clean it up.`,
+        );
+      } else {
+        resources.push({
+          type: "unreachable",
+          ref: project.cloudWorkspaceId,
+          label: `cloud workspace ${project.cloudWorkspaceId} (cloud unreachable)`,
+          runtime: null,
+        });
+      }
     }
   }
 
@@ -221,6 +374,8 @@ export async function collectProjectManifest(
   const TYPE_ORDER: Record<CleanupResource["type"], number> = {
     container: 0,
     artifact: 0,
+    cloud_workspace: 0,
+    unreachable: 0,
     image: 1,
     route: 2,
     volume: 3,
@@ -268,7 +423,11 @@ export async function previewProjectDeletion(project: Project): Promise<Deletion
     }
 
     if (dep.containerId && runtime instanceof DockerRuntime) {
-      const vols = await runtime.inspectNamedVolumes(dep.containerId).catch(() => [] as string[]);
+      const vols = await withTimeout(
+        runtime.inspectNamedVolumes(dep.containerId),
+        INSPECT_TIMEOUT_MS,
+        `preview volumes ${dep.containerId}`,
+      ).catch(() => [] as string[]);
       for (const v of vols) deploymentVolumes.push(v);
     }
 
@@ -284,7 +443,11 @@ export async function previewProjectDeletion(project: Project): Promise<Deletion
     const link = serviceContainerByServiceId.get(svc.id);
     let volumes: string[] = [];
     if (link && link.runtime instanceof DockerRuntime) {
-      volumes = await link.runtime.inspectNamedVolumes(link.containerId).catch(() => []);
+      volumes = await withTimeout(
+        link.runtime.inspectNamedVolumes(link.containerId),
+        INSPECT_TIMEOUT_MS,
+        `preview volumes ${link.containerId}`,
+      ).catch(() => []);
     }
     previewServices.push({
       id: svc.id,
@@ -380,6 +543,27 @@ const RETRY_DELAY_MS = 2000;
  * - Per-item error isolation: one failure doesn't block others
  * - Single retry with backoff for transient failures
  */
+/** Hard ceiling on a single resource destroy (SSH/docker can half-open and
+ *  hang forever). A timeout becomes a counted failure so the batch + the whole
+ *  runtime_cleanup step stay bounded — critical because the teardown holds the
+ *  deletion lock until it returns. */
+const DESTROY_TIMEOUT_MS = 30_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`cleanup timed out after ${ms}ms: ${label}`)),
+      ms,
+    );
+    // Don't let the timer keep the process alive once the race settles.
+    (timer as { unref?: () => void }).unref?.();
+  });
+  // clearTimeout on settle so a successful inspect/destroy doesn't leave a live
+  // 10–30s timer (holding its closure) for every resource in a large manifest.
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
 export async function executeCleanup(
   manifest: CleanupManifest,
   opts?: { concurrency?: number },
@@ -419,11 +603,11 @@ async function destroyResource(
   routing: ReturnType<typeof platform>["routing"],
 ): Promise<void> {
   try {
-    await destroyResourceOnce(resource, routing);
+    await withTimeout(destroyResourceOnce(resource, routing), DESTROY_TIMEOUT_MS, resource.label);
   } catch (firstErr) {
-    // Retry once after backoff
+    // Retry once after backoff (also bounded — the retry can hang too).
     await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-    await destroyResourceOnce(resource, routing);
+    await withTimeout(destroyResourceOnce(resource, routing), DESTROY_TIMEOUT_MS, resource.label);
   }
 }
 
@@ -436,6 +620,19 @@ async function destroyResourceOnce(
       if (!resource.runtime) return;
       await resource.runtime.destroy(resource.ref);
       return;
+    }
+    case "cloud_workspace": {
+      if (!resource.runtime) return;
+      await resource.runtime.destroy(resource.ref);
+      return;
+    }
+    case "unreachable": {
+      // We know this resource exists but can't reach its runtime right now
+      // (cloud down, or a still-existing server that's transiently
+      // unreachable). Throw so runtime_cleanup is marked failed and the
+      // teardown's atomicity gate KEEPS the project row for a later retry —
+      // deleting it would orphan a live resource.
+      throw new Error(`${resource.label}: unreachable — project kept, retry once reachable`);
     }
     case "image": {
       if (!resource.runtime || !(resource.runtime instanceof DockerRuntime)) return;

@@ -166,11 +166,17 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
           // Edge deployments may send either default messages or named request events.
           es.onmessage = handleRequestEvent;
           es.addEventListener("request", handleRequestEvent);
-        } else {
+        } else if (tokenRes.kind === "self-hosted") {
           // Self-hosted: connect to API SSE
           const streamUrl = `${getApiBaseUrl()}${endpoints.projects.serverLogsStream(projectId)}`;
           es = new EventSource(streamUrl, { withCredentials: true });
           es.addEventListener("request", handleRequestEvent);
+        } else {
+          // Cloud project whose live stream token isn't available right now.
+          // Do NOT hit /server-logs/stream — it 400s for cloud. The recent-logs
+          // fetch below still shows history; just no live tail, no hard error.
+          if (!cancelled) setIsLoading(false);
+          return;
         }
 
         es.addEventListener("error", handleErrorEvent);

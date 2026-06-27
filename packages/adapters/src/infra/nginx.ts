@@ -379,6 +379,19 @@ ${webhookLocation}
    */
   async renewCert(domain: string): Promise<SslResult> {
     assertValidDomain(domain);
+
+    // `certbot renew` only acts on certs that ALREADY exist. A domain that
+    // never got its first cert (initial provision failed, or was skipped)
+    // has nothing to renew — certbot exits 0 doing nothing, so the caller
+    // sees "renewed" while the domain stays stuck in `provisioning`. When no
+    // cert exists yet, "renew" must mean "obtain the first one" → delegate to
+    // provisionCert (certbot certonly), which also rewrites the vhost with the
+    // 443/ssl block and reloads. This is what makes the Renew button able to
+    // bootstrap a domain that has only an HTTP vhost.
+    if (!(await this.certsExist(domain))) {
+      return this.provisionCert(domain);
+    }
+
     await this._exec("certbot", ["renew", "--cert-name", domain, "--non-interactive"]);
     await this.reload();
 

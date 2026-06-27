@@ -244,18 +244,38 @@ const EMPTY_SUMMARY: AnalyticsSummary = {
   lastUpdated: null,
 };
 
+/**
+ * The Oblien SDK returns `{ success, data: AnalyticsBucket[], meta }`; the cloud
+ * PROXY wraps that again as `{ data: <sdkResponse> }`. So the bucket array sits
+ * at `.data` (admin-direct) or `.data.data` (cloud-proxied). Reading a fixed
+ * depth got the WRAPPER object on the proxied path — which flat-mapped into a
+ * single bogus "bucket" whose numeric fields were undefined → NaN → null totals.
+ * Walk down nested data/result wrappers to the actual array regardless of depth.
+ */
+function extractCloudBuckets(result: unknown): CloudAnalyticsBucket[] {
+  let node: unknown = result;
+  for (let depth = 0; depth < 4 && node && typeof node === "object"; depth++) {
+    const obj = node as Record<string, unknown>;
+    if (Array.isArray(obj.data)) return obj.data as CloudAnalyticsBucket[];
+    node = obj.data ?? obj.result;
+  }
+  return Array.isArray(result) ? (result as CloudAnalyticsBucket[]) : [];
+}
+
 async function fetchCloudTimeseries(
   organizationId: string,
   domain: string,
   params: { from: number; to: number; interval: "hour" },
 ): Promise<CloudTimeseriesResponse | null> {
+  // Direct, no caching — always the live source of truth. (Request volume is
+  // controlled on the client; see ServerAnalytics fetch dedup.)
   const client = getAdminOblienClient();
-
-  if (client) {
-    return client.analytics.timeseries(domain, params);
-  }
-
-  return cloudClient({ organizationId }).analytics.timeseries(domain, params);
+  const raw = client
+    ? await client.analytics.timeseries(domain, params)
+    : await cloudClient({ organizationId }).analytics.timeseries(domain, params);
+  // extractCloudBuckets is response PARSING (unwrap the SaaS envelope), not a
+  // cache — it just turns the wire shape into { data: bucket[] }.
+  return { data: extractCloudBuckets(raw) };
 }
 
 export interface AnalyticsSummary {
@@ -312,53 +332,81 @@ export interface ContainerUsageSnapshot {
  * SaaS/OpenShip Cloud projects read from Oblien only.
  * Self-hosted projects combine DB history with the live OpenResty tail.
  */
-export async function getAnalyticsSummary(
+/**
+ * Fetch a project's traffic ONCE and derive BOTH the cumulative summary and the
+ * hourly periods from the same buckets. The dashboard reads this single endpoint
+ * so a project view makes ONE cloud round-trip, instead of the two it used to
+ * (separate /summary + /periods each re-fetching the identical timeseries).
+ *
+ * Cloud projects read from Oblien; self-hosted combine DB history + the live
+ * OpenResty tail. `from`/`to` default to the last 24h. No caching — the SaaS is
+ * the live source of truth; request volume is controlled on the client.
+ */
+export async function getAnalyticsOverview(
   ctx: RequestContext,
   projectId: string,
-): Promise<AnalyticsSummary> {
+  from?: string,
+  to?: string,
+): Promise<{ summary: AnalyticsSummary; periods: AnalyticsPeriod[] }> {
   const project = await repos.project.findById(projectId);
   if (!project || project.organizationId !== ctx.organizationId) {
     throw new NotFoundError("Project", projectId);
   }
 
   const sources = await resolveProjectTrafficSources(projectId);
-  if (sources.length === 0) {
-    return EMPTY_SUMMARY;
-  }
+  if (sources.length === 0) return { summary: EMPTY_SUMMARY, periods: [] };
 
   if (sources.every((source) => source.kind === "cloud")) {
-    const toMs = Date.now();
-    const fromMs = toMs - 24 * 60 * 60 * 1000;
+    const toMs = to ? new Date(to).getTime() : Date.now();
+    const fromMs = from ? new Date(from).getTime() : toMs - 24 * 60 * 60 * 1000;
     const params = { from: fromMs, to: toMs, interval: "hour" as const };
     const responses = await Promise.all(
-      sources.map((source) => fetchCloudTimeseries(ctx.organizationId, source.domain, params).catch(() => null)),
+      sources.map((source) =>
+        fetchCloudTimeseries(ctx.organizationId, source.domain, params).catch(() => null),
+      ),
     );
     const buckets = responses.flatMap((response) => response?.data ?? []);
-
-    if (buckets.length === 0) return EMPTY_SUMMARY;
-
-    return summariseCloudBuckets(buckets, new Date(toMs).toISOString());
+    if (buckets.length === 0) return { summary: EMPTY_SUMMARY, periods: [] };
+    return {
+      summary: summariseCloudBuckets(buckets, new Date(toMs).toISOString()),
+      periods: buildCloudHourlyPeriods(buckets, fromMs, toMs),
+    };
   }
 
   const now = Math.floor(Date.now() / 60_000);
+  const fromMinute = from ? Math.floor(new Date(from).getTime() / 60_000) : now - 1440;
+  const toMinute = to ? Math.floor(new Date(to).getTime() / 60_000) : now;
   const selfHostedSources = sources.filter((source) => source.kind === "self-hosted");
   const bucketSets = await Promise.all(
     selfHostedSources.map(async ({ domain, serverId }) => {
-      // DB: flushed archive (last 24h of persisted data)
-      const dbBuckets = await repos.analytics.recentBuckets({ serverId, domain, limit: 1440 });
-
-      // Live OpenResty: unflushed tail (since last scraper flush)
-      // The scraper flushes up to `now - 1` so live always has at least the current minute
-      const lastFlushed = dbBuckets.length > 0 ? dbBuckets[0]!.minute : now - 1440;
-      const liveBuckets = await fetchLiveBuckets(serverId, domain, lastFlushed + 1, now);
+      // DB: flushed archive for the requested range.
+      const dbBuckets = await repos.analytics.queryBuckets({ serverId, domain, fromMinute, toMinute });
+      // Live OpenResty: unflushed tail (starts after the last persisted minute).
+      const lastDbMinute =
+        dbBuckets.length > 0 ? Math.max(...dbBuckets.map((b) => b.minute)) : fromMinute - 1;
+      const liveFrom = Math.max(lastDbMinute + 1, fromMinute);
+      const liveBuckets =
+        liveFrom <= toMinute ? await fetchLiveBuckets(serverId, domain, liveFrom, toMinute) : [];
       return [...dbBuckets.map(toMgmtBucket), ...liveBuckets];
     }),
   );
   const allBuckets: MgmtAnalyticsBucket[] = bucketSets.flat();
+  if (allBuckets.length === 0) return { summary: EMPTY_SUMMARY, periods: [] };
+  return {
+    summary: summariseBuckets(allBuckets, new Date().toISOString()),
+    periods: buildHourlyPeriods(allBuckets, fromMinute, toMinute),
+  };
+}
 
-  if (allBuckets.length === 0) return EMPTY_SUMMARY;
-
-  return summariseBuckets(allBuckets, new Date().toISOString());
+/**
+ * Cumulative summary for a project (last 24h). Thin wrapper over
+ * getAnalyticsOverview so there's a single fetch+compute implementation.
+ */
+export async function getAnalyticsSummary(
+  ctx: RequestContext,
+  projectId: string,
+): Promise<AnalyticsSummary> {
+  return (await getAnalyticsOverview(ctx, projectId)).summary;
 }
 
 // ─── Analytics periods ───────────────────────────────────────────────────────
@@ -370,57 +418,17 @@ export async function getAnalyticsSummary(
  * Self-hosted projects combine DB history with the live OpenResty tail,
  * grouped into hourly periods for charting.
  */
+/**
+ * Hourly periods for a project over [from,to] (default last 24h). Thin wrapper
+ * over getAnalyticsOverview so there's a single fetch+compute implementation.
+ */
 export async function getAnalyticsPeriods(
   ctx: RequestContext,
   projectId: string,
   from?: string,
   to?: string,
 ): Promise<AnalyticsPeriod[]> {
-  const project = await repos.project.findById(projectId);
-  if (!project || project.organizationId !== ctx.organizationId) {
-    throw new NotFoundError("Project", projectId);
-  }
-
-  const sources = await resolveProjectTrafficSources(projectId);
-  if (sources.length === 0) return [];
-
-  if (sources.every((source) => source.kind === "cloud")) {
-    const toMs = to ? new Date(to).getTime() : Date.now();
-    const fromMs = from ? new Date(from).getTime() : toMs - 24 * 60 * 60 * 1000;
-    const params = { from: fromMs, to: toMs, interval: "hour" as const };
-    const responses = await Promise.all(
-      sources.map((source) => fetchCloudTimeseries(ctx.organizationId, source.domain, params).catch(() => null)),
-    );
-    const buckets = responses.flatMap((response) => response?.data ?? []);
-
-    if (buckets.length === 0) return [];
-
-    return buildCloudHourlyPeriods(buckets, fromMs, toMs);
-  }
-
-  const now = Math.floor(Date.now() / 60_000);
-  const fromMinute = from ? Math.floor(new Date(from).getTime() / 60_000) : now - 1440;
-  const toMinute = to ? Math.floor(new Date(to).getTime() / 60_000) : now;
-  const selfHostedSources = sources.filter((source) => source.kind === "self-hosted");
-  const bucketSets = await Promise.all(
-    selfHostedSources.map(async ({ domain, serverId }) => {
-      // DB: flushed archive for the requested range
-      const dbBuckets = await repos.analytics.queryBuckets({ serverId, domain, fromMinute, toMinute });
-
-      // Live OpenResty: unflushed tail (starts after last DB minute)
-      const lastDbMinute =
-        dbBuckets.length > 0 ? Math.max(...dbBuckets.map((b) => b.minute)) : fromMinute - 1;
-      const liveFrom = Math.max(lastDbMinute + 1, fromMinute);
-      const liveBuckets =
-        liveFrom <= toMinute ? await fetchLiveBuckets(serverId, domain, liveFrom, toMinute) : [];
-      return [...dbBuckets.map(toMgmtBucket), ...liveBuckets];
-    }),
-  );
-  const allBuckets: MgmtAnalyticsBucket[] = bucketSets.flat();
-
-  if (allBuckets.length === 0) return [];
-
-  return buildHourlyPeriods(allBuckets, fromMinute, toMinute);
+  return (await getAnalyticsOverview(ctx, projectId, from, to)).periods;
 }
 
 // ─── Deployment stats ────────────────────────────────────────────────────────

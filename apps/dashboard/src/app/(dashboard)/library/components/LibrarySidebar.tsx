@@ -1,7 +1,8 @@
 "use client";
 
-import React from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import { githubApi } from "@/lib/api";
 import {
   Github,
   Lock,
@@ -45,6 +46,11 @@ export function LibrarySidebar({
   const publicCount = repos.filter((r) => !r.private).length;
   const privateCount = repos.filter((r) => r.private).length;
 
+  // NOTE: the library never probes the App. The state here is gh-FIRST (from
+  // GET /github/home, which is zero-cloud when gh is logged in), so the App
+  // row deliberately shows "Manage in Settings" rather than a definitive
+  // connected/disconnected — the App's real status lives on the Settings page
+  // (GET /github/status), the ONLY place we pay the cloud round-trip.
   return (
     <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
       {/* ── Connection status ─────────────────────────────────────
@@ -189,8 +195,6 @@ function SaasConnectionCard({
  */
 function SelfHostedConnectionCard({
   state,
-  cloudConnected,
-  selectedOwner,
 }: {
   state: GitHubConnectionState;
   cloudConnected: boolean;
@@ -198,8 +202,40 @@ function SelfHostedConnectionCard({
 }) {
   const cliConnected = state.sources.ghCli.available;
   const cliLogin = state.sources.ghCli.login;
-  const appConnected = state.sources.openshipApp.connected;
-  const appLogin = state.sources.openshipApp.login;
+
+  // App status is NOT part of the gh-first `state` (GET /github/home is
+  // zero-cloud by design). To show the REAL App connection without slowing the
+  // library, we fetch GET /github/status once on mount — non-blocking, so the
+  // card renders immediately from gh state and the App row resolves a beat
+  // later. `null` = still checking. This is the one place in the library that
+  // pays the cloud round-trip, and only for this secondary row.
+  const [appStatus, setAppStatus] = useState<{ connected: boolean; login?: string | null } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    githubApi
+      .getStatusDeduped<any>()
+      .then((res) => {
+        if (cancelled) return;
+        const app = res?.state?.sources?.openshipApp;
+        setAppStatus({ connected: Boolean(app?.connected), login: app?.login ?? null });
+      })
+      .catch(() => {
+        // Cloud unreachable / no link — leave the row neutral rather than
+        // asserting a false "disconnected".
+        if (!cancelled) setAppStatus({ connected: false, login: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const appSublabel =
+    appStatus === null
+      ? "Checking…"
+      : appStatus.connected
+        ? appStatus.login ? `@${appStatus.login}` : "Connected"
+        : "Not connected — manage in Settings";
 
   return (
     <div className="bg-card rounded-2xl border border-border/50 p-5">
@@ -218,39 +254,32 @@ function SelfHostedConnectionCard({
           tone="primary"
         />
 
-        {/* SECONDARY: Openship Cloud App */}
+        {/* SECONDARY: Openship Cloud App. Real status comes from the async
+            /github/status probe above — accurate without blocking the library. */}
         <SourceRow
           icon={Cloud}
           label="Openship Cloud App"
-          sublabel={
-            appConnected
-              ? `@${appLogin ?? selectedOwner ?? "connected"}`
-              : cloudConnected
-                ? "Install the GitHub App"
-                : "Connect Openship Cloud for safer remote clones"
-          }
-          connected={appConnected}
+          sublabel={appSublabel}
+          connected={appStatus?.connected ?? false}
           tone="secondary"
         />
       </div>
 
-      {/* Footnote: tells the user WHY two sources */}
-      {!appConnected && (
-        <div className="mt-4 flex items-start gap-2 rounded-xl border border-border/40 bg-muted/30 px-3 py-2.5">
-          <Shield className="size-3.5 text-muted-foreground shrink-0 mt-0.5" />
-          <p className="text-xs text-muted-foreground leading-relaxed">
-            Remote deploys on Openship Cloud use short-lived, App-scoped
-            tokens.{" "}
-            <Link
-              href="/settings"
-              className="font-medium text-foreground hover:underline"
-            >
-              {cloudConnected ? "Install GitHub App" : "Connect Openship Cloud"}
-            </Link>
-            .
-          </p>
-        </div>
-      )}
+      {/* Footnote: the library is gh-driven; App status + install live in Settings */}
+      <div className="mt-4 flex items-start gap-2 rounded-xl border border-border/40 bg-muted/30 px-3 py-2.5">
+        <Shield className="size-3.5 text-muted-foreground shrink-0 mt-0.5" />
+        <p className="text-xs text-muted-foreground leading-relaxed">
+          gh CLI drives the library locally. For remote deploys, the Openship
+          Cloud App mints short-lived tokens —{" "}
+          <Link
+            href="/settings"
+            className="font-medium text-foreground hover:underline"
+          >
+            manage GitHub in Settings
+          </Link>
+          .
+        </p>
+      </div>
     </div>
   );
 }

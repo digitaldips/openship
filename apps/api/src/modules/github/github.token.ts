@@ -62,7 +62,8 @@ import {
   getInstallationToken,
   getUserToken,
 } from "./github.auth";
-import { getLocalGhToken } from "./github.local-auth";
+// gh-CLI (github.local-auth) is imported DYNAMICALLY at its two self-hosted
+// "local"-purpose call sites below, so the gh module never loads in CLOUD_MODE.
 import { canUseGitHubRepo } from "./github-access";
 import type { RequestContext } from "../../lib/request-context";
 
@@ -182,6 +183,9 @@ export async function tokenFor(
     // yes, org → opt-in) is centralized in mayUseOperatorCliToken so this
     // resolution step is just "pick the token if authorized".
     if (await mayUseOperatorCliToken(userId, organizationId, purpose)) {
+      // Dynamic import: reached only on the self-hosted "local" purpose
+      // (the CLOUD_MODE branch returned above), so gh never loads on the SaaS.
+      const { getLocalGhToken } = await import("./github.local-auth");
       const cli = await getLocalGhToken();
       if (cli) return { token: cli, source: "gh-cli" };
     }
@@ -298,6 +302,8 @@ export async function canResolveTokenFor(
     // purpose "local"), so the existence check can't drift from the real
     // resolution policy.
     if (await mayUseOperatorCliToken(userId, organizationId, "local")) {
+      // Dynamic import (self-hosted local only) — gh never loads on the SaaS.
+      const { getLocalGhToken } = await import("./github.local-auth");
       const cli = await getLocalGhToken();
       if (cli) return "gh-cli";
     }

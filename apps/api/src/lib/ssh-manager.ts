@@ -94,6 +94,21 @@ export async function buildSshConfig(
     if (settings.sshKeyPassphrase) {
       config.privateKeyPassphrase = decryptSecretField(settings.sshKeyPassphrase);
     }
+  } else if (settings.sshAuthMethod === "agent") {
+    // Use the host's SSH agent (SSH_AUTH_SOCK) — like VSCode Remote-SSH. No
+    // password or key is stored; the agent must already hold a key the
+    // server accepts (e.g. the operator ran `ssh-copy-id` / `ssh` to it
+    // before). Self-hosted only — this is the API host's own agent. The
+    // `sshAgent` field flows through toConnectConfig → ssh2's `agent` option.
+    const sock = process.env.SSH_AUTH_SOCK;
+    if (!sock) {
+      throw new Error(
+        "SSH agent auth is selected, but no agent is available on this host " +
+          "(SSH_AUTH_SOCK is unset). Start an ssh-agent and add the key, or " +
+          "switch this server to password/key auth.",
+      );
+    }
+    config.sshAgent = sock;
   } else {
     return null;
   }
@@ -116,6 +131,14 @@ const DEFAULTS = {
   idleTimeoutMs: 5 * 60_000,
 } as const;
 
+// Circuit-breaker. After this many consecutive connect/command failures, a
+// server is marked unhealthy and acquire() FAST-FAILS for COOLDOWN_MS instead
+// of re-attempting — which otherwise re-eats a multi-second timeout on every
+// poll tick (e.g. the 3s live-metrics SSE hammering an unreachable box with
+// 5s command timeouts). One success resets it.
+const FAIL_THRESHOLD = 2;
+const COOLDOWN_MS = 30_000;
+
 // ─── Per-server connection state ─────────────────────────────────────────────
 
 interface ServerConnection {
@@ -129,6 +152,8 @@ export class SshConnectionManager {
   private servers = new Map<string, ServerConnection>();
   private connecting = new Map<string, Promise<CommandExecutor>>();
   private retainCounts = new Map<string, number>();
+  /** Circuit-breaker state per server (consecutive fails + cooldown deadline). */
+  private health = new Map<string, { fails: number; unhealthyUntil: number }>();
   private destroyed = false;
   private readonly opts: Required<SshManagerOptions>;
 
@@ -155,6 +180,16 @@ export class SshConnectionManager {
       return cached.executor;
     }
 
+    // Circuit-breaker: a server that just failed repeatedly is in cooldown —
+    // fast-fail instead of attempting (and waiting out) another timeout.
+    const cooldownLeft = this.cooldownRemaining(serverId);
+    if (cooldownLeft > 0) {
+      debugSsh(`acquire:short-circuit server=${serverId} cooldown=${cooldownLeft}ms`);
+      throw new Error(
+        `Server is unreachable — cooling down after repeated failures, retry in ~${Math.ceil(cooldownLeft / 1000)}s.`,
+      );
+    }
+
     // Dedup concurrent acquire() calls for the same server
     const pending = this.connecting.get(serverId);
     if (pending) {
@@ -169,10 +204,12 @@ export class SshConnectionManager {
       const exec = await promise;
       this.servers.set(serverId, { executor: exec, idleTimer: null });
       this.touchIdleTimer(serverId);
+      this.recordSuccess(serverId);
       debugSsh(`acquire:executor-ready server=${serverId} (${formatDuration(startedAt)})`);
       return exec;
     } catch (err) {
       const msg = safeErrorMessage(err);
+      this.recordFailure(serverId);
       debugSsh(`acquire:failed server=${serverId} (${formatDuration(startedAt)}) ${msg}`);
       throw err;
     } finally {
@@ -195,6 +232,7 @@ export class SshConnectionManager {
     const executor = await this.acquire(serverId);
     try {
       const result = await fn(executor);
+      this.recordSuccess(serverId);
       debugSsh(`withExecutor:done server=${serverId} (${formatDuration(startedAt)})`);
       return result;
     } catch (err) {
@@ -204,10 +242,16 @@ export class SshConnectionManager {
         this.dropServer(serverId);
         const freshExecutor = await this.acquire(serverId);
         const result = await fn(freshExecutor);
+        this.recordSuccess(serverId);
         debugSsh(`withExecutor:retry-done server=${serverId} (${formatDuration(startedAt)})`);
         return result;
       }
       const msg = safeErrorMessage(err);
+      // Connection errors and command timeouts count toward the breaker — a
+      // sick/unreachable box shouldn't be re-hit every poll tick.
+      if (isRetryableRemoteConnectionError(err) || /timed out|timeout|ETIMEDOUT/i.test(msg)) {
+        this.recordFailure(serverId);
+      }
       debugSsh(`withExecutor:failed server=${serverId} (${formatDuration(startedAt)}) ${msg}`);
       throw err;
     }
@@ -228,11 +272,14 @@ export class SshConnectionManager {
     if (serverId) {
       debugSsh(`invalidate server=${serverId}`);
       this.dropServer(serverId);
+      // Config changed / explicit reset → give the breaker a fresh start.
+      this.health.delete(serverId);
     } else {
       debugSsh("invalidate:all");
       for (const id of [...this.servers.keys()]) {
         this.dropServer(id);
       }
+      this.health.clear();
     }
   }
 
@@ -297,6 +344,33 @@ export class SshConnectionManager {
     const executor = createExecutor(sshConfig);
     debugSsh(`connect:executor-prepared server=${serverId} (${formatDuration(startedAt)}) host=${sshConfig.host}`);
     return executor;
+  }
+
+  // ── Circuit-breaker ────────────────────────────────────────────────────
+
+  /** Milliseconds remaining in this server's cooldown, or 0 if healthy. */
+  private cooldownRemaining(serverId: string): number {
+    const h = this.health.get(serverId);
+    if (!h) return 0;
+    return Math.max(0, h.unhealthyUntil - Date.now());
+  }
+
+  /** One success clears the breaker entirely. */
+  private recordSuccess(serverId: string): void {
+    if (this.health.has(serverId)) this.health.delete(serverId);
+  }
+
+  /** Count a connect/command failure; trip the breaker at the threshold and
+   *  drop any cached (now-suspect) connection so the cooldown actually bites. */
+  private recordFailure(serverId: string): void {
+    const h = this.health.get(serverId) ?? { fails: 0, unhealthyUntil: 0 };
+    h.fails += 1;
+    if (h.fails >= FAIL_THRESHOLD) {
+      h.unhealthyUntil = Date.now() + COOLDOWN_MS;
+      this.dropServer(serverId);
+      debugSsh(`circuit-open server=${serverId} fails=${h.fails} cooldown=${COOLDOWN_MS}ms`);
+    }
+    this.health.set(serverId, h);
   }
 
   // ── Idle timer ─────────────────────────────────────────────────────────

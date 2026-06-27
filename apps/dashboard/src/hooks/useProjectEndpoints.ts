@@ -9,8 +9,9 @@
  *   - returns the same { data, isLoading, error } shape
  *
  * There is NO shared state, NO context, NO useMemo soup, NO cross-coupling.
- * If you only need stats data, call `useAnalyticsSummary(id)` and gate your
- * skeleton on its `isLoading` — a slow `getInfo` cannot affect you.
+ * For traffic stats + chart, call `useAnalyticsData(id)` (backed by a single
+ * /analytics/overview fetch) and gate your skeleton on its `isLoading` — a slow
+ * `getInfo` cannot affect you.
  *
  * Dedup across components: each endpoint has a module-level in-flight
  * promise + resolved-result cache keyed by id, so OverviewTab and
@@ -53,6 +54,13 @@ export interface AnalyticsPeriodResponse {
   bandwidthIn: number;
   bandwidthOut: number;
   avgResponseTimeMs: number;
+}
+
+/** /analytics/overview — summary + periods from one server fetch (one cloud
+ *  round-trip), so the dashboard doesn't hit the SaaS twice per project view. */
+export interface AnalyticsOverviewResponse {
+  summary: AnalyticsSummaryResponse;
+  periods: AnalyticsPeriodResponse[];
 }
 
 /** Legacy combined shape used by display components. Derived from summary
@@ -114,8 +122,7 @@ type CacheEntry<T> =
   | { kind: "ready"; data: T };
 
 const infoCache = new Map<string, CacheEntry<ProjectInfoData>>();
-const summaryCache = new Map<string, CacheEntry<AnalyticsSummaryResponse>>();
-const periodsCache = new Map<string, CacheEntry<AnalyticsPeriodResponse[]>>();
+const overviewCache = new Map<string, CacheEntry<AnalyticsOverviewResponse>>();
 
 // ─── Revision store (drives live refresh on invalidation) ──────────────────
 //
@@ -263,26 +270,18 @@ async function fetchProjectInfo(id: string): Promise<ProjectInfoData> {
   return response.data;
 }
 
-async function fetchSummary(id: string): Promise<AnalyticsSummaryResponse> {
-  const response = await api.get<{ data: AnalyticsSummaryResponse; success?: boolean; error?: string }>(
-    endpoints.analytics.summary,
+async function fetchOverview(id: string): Promise<AnalyticsOverviewResponse> {
+  const response = await api.get<{ data: AnalyticsOverviewResponse; success?: boolean; error?: string }>(
+    endpoints.analytics.overview,
     { params: { projectId: id } },
   );
   if (response.success === false || !response.data) {
-    throw new Error(response.error || "Failed to load analytics summary");
+    throw new Error(response.error || "Failed to load analytics");
   }
-  return response.data;
-}
-
-async function fetchPeriods(id: string): Promise<AnalyticsPeriodResponse[]> {
-  const response = await api.get<{ data: AnalyticsPeriodResponse[]; success?: boolean; error?: string }>(
-    endpoints.analytics.periods,
-    { params: { projectId: id } },
-  );
-  if (response.success === false) {
-    throw new Error(response.error || "Failed to load analytics periods");
-  }
-  return response.data ?? [];
+  return {
+    summary: response.data.summary,
+    periods: response.data.periods ?? [],
+  };
 }
 
 // ─── Public hooks — one per endpoint ───────────────────────────────────────
@@ -307,43 +306,34 @@ export function useProjectInfo(id: string | null | undefined) {
 }
 
 /**
- * Fetches /analytics/summary. Owns the stat-card skeleton (Server Requests
- * / Unique IPs / Avg Response / Bandwidth Out). Independent of project info.
+ * Fetches /analytics/overview — summary + periods in ONE request (one cloud
+ * round-trip server-side). The single source for the Overview / Monitoring
+ * tabs; no separate /summary + /periods double-fetch.
  */
-export function useAnalyticsSummary(id: string | null | undefined) {
-  return useEndpoint(id, summaryCache, fetchSummary);
+export function useAnalyticsOverview(id: string | null | undefined) {
+  return useEndpoint(id, overviewCache, fetchOverview);
 }
 
 /**
- * Fetches /analytics/periods. Owns the traffic chart skeleton. Independent
- * of summary — a slow periods endpoint can't pin the stats and vice versa.
- */
-export function useAnalyticsPeriods(id: string | null | undefined) {
-  return useEndpoint(id, periodsCache, fetchPeriods);
-}
-
-/**
- * Composite hook — returns summary + periods combined into one
- * AnalyticsData object plus the underlying per-endpoint loading states.
- * Use this when a consumer needs both shapes together (Overview /
- * Monitoring tabs). When a consumer only needs one of stats or chart,
- * call `useAnalyticsSummary` / `useAnalyticsPeriods` directly to keep
- * skeletons tight.
+ * Composite hook — returns summary + periods combined into one AnalyticsData
+ * object. Backed by a SINGLE /analytics/overview fetch, so a project view makes
+ * one analytics request (one cloud round-trip) instead of two. The
+ * isLoadingSummary/isLoadingPeriods fields are kept for API compatibility but
+ * now reflect the one shared load.
  */
 export function useAnalyticsData(id: string | null | undefined) {
-  const summary = useAnalyticsSummary(id);
-  const periods = useAnalyticsPeriods(id);
-  const data = summary.data
-    ? mapAnalyticsData(summary.data, periods.data ?? [], "")
-    : null;
+  const overview = useAnalyticsOverview(id);
+  const summary = overview.data?.summary ?? null;
+  const periods = overview.data?.periods ?? null;
+  const data = summary ? mapAnalyticsData(summary, periods ?? [], "") : null;
   return {
     data,
-    summary: summary.data,
-    periods: periods.data,
-    isLoading: summary.isLoading || periods.isLoading,
-    isLoadingSummary: summary.isLoading,
-    isLoadingPeriods: periods.isLoading,
-    error: summary.error ?? periods.error,
+    summary,
+    periods,
+    isLoading: overview.isLoading,
+    isLoadingSummary: overview.isLoading,
+    isLoadingPeriods: overview.isLoading,
+    error: overview.error,
   };
 }
 
@@ -425,7 +415,6 @@ export function mapAnalyticsData(
  */
 export function invalidateProjectCaches(id: string) {
   infoCache.delete(id);
-  summaryCache.delete(id);
-  periodsCache.delete(id);
+  overviewCache.delete(id);
   bumpRevision(id);
 }

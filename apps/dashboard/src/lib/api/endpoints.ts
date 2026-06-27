@@ -141,6 +141,7 @@ export const endpoints = {
   analytics: {
     summary: "analytics",
     periods: "analytics/periods",
+    overview: "analytics/overview",
     deployments: "analytics/deployments",
     usage: "analytics/usage",
     usageStream: "analytics/usage/stream",
