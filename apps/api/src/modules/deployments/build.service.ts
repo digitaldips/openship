@@ -700,7 +700,7 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
-    organizationId: project.organizationId ?? null,
+    organizationId: project.organizationId,
     branch: snapshot.branch,
     commitSha,
     commitMessage,
@@ -1085,7 +1085,7 @@ export async function redeployBuildSession(
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
-    organizationId: project.organizationId ?? null,
+    organizationId: project.organizationId,
     branch,
     commitSha,
     commitMessage,
@@ -1320,7 +1320,7 @@ export async function triggerDeployment(
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
-    organizationId: project.organizationId ?? null,
+    organizationId: project.organizationId,
     branch,
     commitSha,
     commitMessage,

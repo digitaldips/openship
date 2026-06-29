@@ -6,7 +6,7 @@ import { repos } from "@repo/db";
 import { ValidationError, SYSTEM } from "@repo/core";
 import { encrypt, decrypt } from "../../lib/encryption";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
-import type { TSetEnvVarsBody, TMergeEnvVarsBody } from "./project.schema";
+import type { TMergeEnvVarsBody } from "./project.schema";
 
 // ─── List env vars ───────────────────────────────────────────────────────────
 
@@ -41,35 +41,6 @@ export async function listEnvVars(
 
 // ─── Set env vars ────────────────────────────────────────────────────────────
 
-export async function setEnvVars(
-  projectId: string,
-  organizationId: string,
-  data: TSetEnvVarsBody,
-) {
-  const p = await repos.project.findById(projectId);
-  assertResourceInOrg(p, "Project", organizationId, projectId);
-
-  const keys = data.vars.map((v) => v.key);
-  const unique = new Set(keys);
-  if (unique.size !== keys.length) {
-    throw new ValidationError("Duplicate environment variable keys");
-  }
-
-  if (data.vars.length > SYSTEM.ENV_VARS.MAX_PER_PROJECT) {
-    throw new ValidationError(
-      `Maximum ${SYSTEM.ENV_VARS.MAX_PER_PROJECT} variables per project`,
-    );
-  }
-
-  const encrypted = data.vars.map((v) => ({
-    key: v.key,
-    value: encrypt(v.value),
-    isSecret: v.isSecret,
-  }));
-
-  await repos.project.bulkSetEnvVars(projectId, data.environment, encrypted);
-  return { count: data.vars.length };
-}
 
 // ─── Merge env vars (partial — safe for masked secrets) ──────────────────────
 

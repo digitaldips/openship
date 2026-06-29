@@ -210,7 +210,7 @@ function createGitHubReader(
         });
 
         return Array.isArray(contents)
-          ? contents.map((file: any) => ({
+          ? contents.map((file) => ({
               name: file.name,
               type: file.type === "dir" ? "dir" : "file",
             }))

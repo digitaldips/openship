@@ -809,6 +809,27 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       gitToken: gitCred.token,
     });
 
+    // Pre-deploy backups — fire for ALL deploy modes (single-app, static-edge,
+    // AND compose) before any teardown, so a destructive cutover never runs
+    // without a backup. Previously this lived in executeServerDeploy only, so
+    // the compose path (which tears down old containers in deployComposeServices)
+    // ran with NO backup. Best-effort + policy-gated: we await only the enqueue
+    // (durably queued before destruction), never the run — a failing/slow backup
+    // must not block the deploy.
+    try {
+      const preBackup = await firePreDeployBackups({
+        projectId: project.id,
+        organizationId: dep.organizationId,
+      });
+      if (preBackup.enqueued > 0 || preBackup.failed > 0) {
+        logger.log(`[pre-deploy-backup] enqueued=${preBackup.enqueued} failed=${preBackup.failed}`);
+      }
+    } catch (err) {
+      logger.log(
+        `[pre-deploy-backup] trigger crashed (ignoring, best-effort): ${safeErrorMessage(err)}`,
+      );
+    }
+
     if (useServicePipeline && isMultiServiceRuntime(runtime)) {
       // snapshot.composeServices is a DeployableService[] - mixed compose +
       // monorepo. syncFromCompose strictly owns compose rows; passing a
@@ -1028,28 +1049,11 @@ async function executeStaticEdgeDeploy(
     durationMs: buildResult.durationMs ?? 0,
   });
 
-  // Hand the previous-active deployment over to the rollback orchestrator —
-  // same as the server-deploy path. Without this, edge/static deploys never
-  // archive the prior deployment and snapshot rollback eligibility is silently
-  // broken. Git-strategy deploys skip this since rollback re-clones at
-  // commit_sha_before.
-  if (dep.rollbackStrategy !== "git") {
-    const { onDeploymentReady } = await import("./rollback");
-    const finalDep = await repos.deployment.findById(dep.id);
-    const prevDep = project.activeDeploymentId
-      ? await repos.deployment.findById(project.activeDeploymentId)
-      : null;
-    if (finalDep) {
-      await onDeploymentReady({
-        newDeployment: finalDep,
-        previousActive: prevDep ?? null,
-      });
-    }
-  } else {
-    logger.log(
-      "Skipping snapshot/artifact archive — rollback strategy is 'git' (rollback re-clones at commit_sha_before).",
-    );
-  }
+  // Archive the previous-active deployment for rollback — same helper the
+  // server + compose paths use. (Previously hand-copied here WITHOUT the
+  // helper's best-effort try/catch, so an archive failure threw and failed the
+  // deploy; the shared helper keeps it best-effort per its contract.)
+  await archivePreviousDeployment(dep, project, logger);
 }
 
 /**
@@ -1263,30 +1267,8 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     ? createTrackedSslProvider(ssl, domainByHostname)
     : ssl;
 
-  // Pre-deploy backups — fire BEFORE runDeployPipeline so the snapshot
-  // captures the OLD container's state before runtime.destroy() in
-  // compose/deploy.service.ts wipes it. Best-effort: we await only the
-  // enqueue (so we know the run is durably queued before destruction),
-  // not the run itself — a failing or slow backup must not block the
-  // deploy. firePreDeployBackups returns { enqueued, failed } and
-  // logs internally; we surface the count to the build log.
-  try {
-    const preBackup = await firePreDeployBackups({
-      projectId: project.id,
-      organizationId: dep.organizationId,
-    });
-    if (preBackup.enqueued > 0 || preBackup.failed > 0) {
-      logger.log(
-        `[pre-deploy-backup] enqueued=${preBackup.enqueued} failed=${preBackup.failed}`,
-      );
-    }
-  } catch (err) {
-    logger.log(
-      `[pre-deploy-backup] trigger crashed (ignoring, best-effort): ${
-        safeErrorMessage(err)
-      }`,
-    );
-  }
+  // (Pre-deploy backups now fire once in executeBuildAndDeploy, covering all
+  // deploy modes — see the firePreDeployBackups call before the compose branch.)
 
   // Reap leftover containers from a previous MULTI-SERVICE / monorepo
   // deployment when this deploy collapses to single-app mode. runDeployPipeline

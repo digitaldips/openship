@@ -636,7 +636,7 @@ export const DomainSettings = () => {
 
     setIsSavingPublicEndpoints(true);
     try {
-      await projectsApi.patch(id, {
+      await projectsApi.update(id, {
         publicEndpoints: payload,
         ...(typeof primaryPort === "number" ? { port: primaryPort } : {}),
       });

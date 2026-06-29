@@ -40,7 +40,7 @@ export const ProjectSidebar = () => {
   const { projectData, projectNotFound, activeTab, tabs, setActiveTab, domain } =
     useProjectSettings();
   const { selfHosted, baseDomain } = usePlatform();
-  const status = getProjectStatus(projectData as any);
+  const status = getProjectStatus(projectData);
   const meta = PROJECT_STATUS_META[status];
   const localPort = projectData.port || 3000;
   const localUrl = `localhost:${localPort}`;

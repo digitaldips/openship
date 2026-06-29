@@ -3,7 +3,7 @@
  */
 
 import { repos, type Deployment, type NewProject, type Project, type Server } from "@repo/db";
-import { slugify, NotFoundError, ConflictError, ValidationError, SYSTEM } from "@repo/core";
+import { slugify, NotFoundError, ConflictError, ValidationError, SYSTEM, safeErrorMessage } from "@repo/core";
 import type { ResourceConfig } from "@repo/adapters";
 import { encodeResources } from "../../lib/resources";
 import { normalizeRollbackWindow } from "../../lib/release-retention";
@@ -426,6 +426,13 @@ export async function ensureProject(
       update.cloudArchiveStrategy = data.cloudArchiveStrategy;
     }
 
+    if (Object.keys(update).length > 0) {
+      await repos.project.update(project.id, update);
+    }
+
+    // Reconcile routes AFTER persisting the project (best-effort) so a route-sync
+    // failure can't discard the field edits we just committed; the next deploy
+    // re-syncs routes. Same ordering as updateOptions.
     if (
       data.publicEndpoints !== undefined ||
       update.slug !== undefined ||
@@ -434,12 +441,11 @@ export async function ensureProject(
       await syncProjectRouteState(project, {
         nextPublicEndpoints: data.publicEndpoints,
         slug: typeof update.slug === "string" ? update.slug : project.slug,
-      });
+      }).catch((err) =>
+        console.warn(`[ensureProject] route sync failed (non-fatal): ${safeErrorMessage(err)}`),
+      );
     }
 
-    if (Object.keys(update).length > 0) {
-      await repos.project.update(project.id, update);
-    }
     if (
       project.appId &&
       typeof update.slug === "string" &&
@@ -607,6 +613,11 @@ export async function updateProject(
     update.defaultRollbackStrategy = data.defaultRollbackStrategy;
   }
 
+  await repos.project.update(projectId, update);
+
+  // Reconcile routes AFTER persisting the project (best-effort) — a route-sync
+  // failure must not discard the field edits already committed; the next deploy
+  // re-syncs. Same ordering as updateOptions.
   if (
     data.publicEndpoints !== undefined ||
     update.slug !== undefined ||
@@ -615,10 +626,11 @@ export async function updateProject(
     await syncProjectRouteState(p, {
       nextPublicEndpoints: data.publicEndpoints,
       slug: typeof update.slug === "string" ? update.slug : p.slug,
-    });
+    }).catch((err) =>
+      console.warn(`[updateProject] route sync failed (non-fatal): ${safeErrorMessage(err)}`),
+    );
   }
 
-  await repos.project.update(projectId, update);
   if (p.appId) {
     const appUpdate: Record<string, unknown> = {};
     if (typeof update.name === "string") appUpdate.name = update.name;

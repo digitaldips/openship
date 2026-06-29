@@ -6,6 +6,25 @@ import { endpoints } from "./endpoints";
 /*  Projects API                                                      */
 /* ------------------------------------------------------------------ */
 
+/** Build + runtime options accepted by POST /:id/options (updateOptions). All
+ *  optional — only the fields sent are written. Mirrors the backend allowlist. */
+export interface ProjectOptionsBody {
+  framework?: string;
+  packageManager?: string;
+  buildImage?: string;
+  installCommand?: string;
+  buildCommand?: string;
+  startCommand?: string;
+  outputDirectory?: string;
+  productionPaths?: string;
+  rootDirectory?: string;
+  productionPort?: number;
+  productionMode?: string;
+  hasServer?: boolean;
+  hasBuild?: boolean;
+  runtimeMode?: "bare" | "docker";
+}
+
 export interface ScanProjectResponse {
   success: boolean;
   name: string;
@@ -202,27 +221,13 @@ export const projectsApi = {
       body,
     ),
 
-  /** Update full project fields */
-  patch: (
-    id: string | number,
-    body: {
-      name?: string;
-      slug?: string;
-      port?: number;
-      publicEndpoints?: Array<{
-        port?: number;
-        targetPath?: string;
-        domain?: string;
-        customDomain?: string;
-        domainType?: "free" | "custom";
-      }>;
-      hasServer?: boolean;
-      hasBuild?: boolean;
-    },
-  ) => api.patch<any>(endpoints.projects.item(id), body),
 
-  /** Update build options (single field) */
-  setOptions: (id: string | number, options: Record<string, any>) =>
+  /**
+   * Update build + runtime options (any subset). Also the atomic config-save
+   * the deploy wizard's mode=config uses — backend updateOptions writes only the
+   * fields present, in one project row update; it never touches env/git/domains.
+   */
+  setOptions: (id: string | number, options: ProjectOptionsBody) =>
     api.post<any>(endpoints.projects.options(id), options),
 
   /** Commit-drift status for the "project outdated" banner: branch HEAD vs the
@@ -257,13 +262,10 @@ export const projectsApi = {
   connectDomain: (id: string | number, body: { domain: string; includeWww: boolean }) =>
     api.post<any>(endpoints.projects.connect(id), body),
 
-  /** Set environment variables (full REPLACE of the environment scope) */
-  setEnv: (id: string | number, envVars: any) =>
-    api.put<any>(endpoints.projects.env(id), envVars),
-
   /**
    * MERGE env vars (partial): upsert + delete only the named keys, leaving every
-   * other var (incl. untouched masked secrets) intact. Safe for the editor.
+   * other var (incl. untouched masked secrets) intact. The only project env
+   * write — the destructive full-replace PUT was removed.
    */
   mergeEnv: (
     id: string | number,
@@ -302,10 +304,6 @@ export const projectsApi = {
   setBranch: (id: string | number, branch: string) =>
     api.post<any>(endpoints.projects.branch(id), { branch }),
 
-  /** Toggle git auto-deploy via git/switch */
-  gitSwitch: (id: string | number, auto_deploy: boolean) =>
-    api.post<any>(endpoints.projects.gitSwitch(id), { auto_deploy }),
-
   /** Toggle auto-deploy setting */
   setAutoDeploy: (id: string | number, enabled: boolean) =>
     api.post<any>(endpoints.projects.autoDeploy(id), { enabled }),
@@ -318,9 +316,10 @@ export const projectsApi = {
   setResources: (id: string | number, resources: Record<string, any>) =>
     api.post<any>(endpoints.projects.resources(id), resources),
 
-  /** Update resources (PUT - raw values) */
+  /** Update resources (PATCH - raw values). Backend registers PATCH/POST for
+   *  /:id/resources (both bound to ctrl.updateResources); there is no PUT. */
   updateResources: (id: string | number, resources: Record<string, any>) =>
-    api.put<any>(endpoints.projects.resources(id), resources),
+    api.patch<any>(endpoints.projects.resources(id), resources),
 
   /** Set sleep-mode */
   setSleepMode: (id: string | number, sleep_mode: string) =>

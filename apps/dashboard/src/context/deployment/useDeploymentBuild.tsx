@@ -56,17 +56,6 @@ function serializeBuildPublicEndpoint(
   };
 }
 
-/** Extract a human-readable message from API errors. */
-function extractErrorMessage(err: unknown, fallback: string): string {
-  if (err instanceof ApiError) {
-    const body = err.body as Record<string, unknown> | undefined;
-    if (body && typeof body.message === "string") return body.message;
-    if (body && typeof body.error === "string") return body.error;
-  }
-  if (err instanceof Error) return err.message;
-  return fallback;
-}
-
 function extractErrorCode(err: unknown): string | null {
   if (err instanceof ApiError) {
     const body = err.body as Record<string, unknown> | undefined;
@@ -635,7 +624,7 @@ export function useDeploymentBuild(
       }
     } catch (err) {
       console.error("Deployment error:", err);
-      const message = extractErrorMessage(err, "Failed to start deployment");
+      const message = getApiErrorMessage(err, "Failed to start deployment");
       const errorCode = extractErrorCode(err);
       const canConnectCloud = canUseCloudConnection({ selfHosted, deployMode });
       const needsManagedProjectDomainHelp =
@@ -955,7 +944,7 @@ export function useDeploymentBuild(
         return { success: true };
       } catch (err) {
         console.error("Error loading build session:", err);
-        const errorMessage = extractErrorMessage(err, "Failed to load build session");
+        const errorMessage = getApiErrorMessage(err, "Failed to load build session");
         showToast(errorMessage, "error", "Error");
         return { success: false, error: errorMessage };
       }
@@ -980,7 +969,7 @@ export function useDeploymentBuild(
       }
     } catch (error) {
       console.error("[DeploymentContext] Error stopping deployment:", error);
-      showToast(extractErrorMessage(error, "Failed to stop deployment"), "error", "Error");
+      showToast(getApiErrorMessage(error, "Failed to stop deployment"), "error", "Error");
     } finally {
       setState((prev) => ({ ...prev, isStopping: false }));
     }
@@ -1059,7 +1048,7 @@ export function useDeploymentBuild(
         return newDeploymentId;
       } catch (error) {
         console.error("[DeploymentContext] Failed to redeploy:", error);
-        const msg = extractErrorMessage(error, "Failed to start redeployment");
+        const msg = getApiErrorMessage(error, "Failed to start redeployment");
         showToast(msg, "error", "Error");
         setState((prev) => ({
           ...prev,

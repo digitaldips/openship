@@ -86,7 +86,7 @@ const DomainSettings: React.FC<DomainSettingsProps> = ({
     const primaryPort = hasServer && "port" in payload[0] ? payload[0].port : undefined;
 
     try {
-      await projectsApi.patch(projectId, {
+      await projectsApi.update(projectId, {
         publicEndpoints: payload,
         ...(typeof primaryPort === "number" ? { port: primaryPort } : {}),
       });

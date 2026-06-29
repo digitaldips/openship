@@ -28,7 +28,6 @@ export const endpoints = {
     gitLink: (id: string | number) => `projects/${id}/git/link`,
     branches: (id: string | number) => `projects/${id}/branches`,
     branch: (id: string | number) => `projects/${id}/branch`,
-    gitSwitch: (id: string | number) => `projects/${id}/git/switch`,
     autoDeploy: (id: string | number) => `projects/${id}/auto-deploy`,
     webhookDomain: (id: string | number) => `projects/${id}/webhook-domain`,
     resources: (id: string | number) => `projects/${id}/resources`,

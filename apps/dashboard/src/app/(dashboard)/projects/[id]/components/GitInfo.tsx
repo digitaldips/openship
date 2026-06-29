@@ -70,7 +70,7 @@ export const GitInfo = () => {
     setLoadingAutoDeploy(true);
     try {
       const newAutoDeployState = !projectData.auto_deploy;
-      const response = await projectsApi.gitSwitch(projectData.id, newAutoDeployState);
+      const response = await projectsApi.setAutoDeploy(projectData.id, newAutoDeployState);
       
       if (response.success) {
         showToast(

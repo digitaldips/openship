@@ -61,7 +61,9 @@ r.post("/:id/disable", { tag: "project:write" }, ctrl.disable);
 // so the permission middleware 400'd before the handler. Secret VALUES stay
 // protected by masking in listEnvVars, not by the route tag.
 r.get("/:id/env", { tag: "project:read" }, ctrl.listEnvVars);
-r.put("/:id/env", { tag: "project:write" }, ctrl.setEnvVars);
+// Project env edits go through the MERGE path (PATCH) only — the old destructive
+// full-replace PUT was removed (it could wipe/corrupt masked secrets and had no
+// remaining caller; the editor sends a diff via mergeEnvVars).
 r.patch("/:id/env", { tag: "project:write" }, ctrl.mergeEnvVars);
 
 /* ─── Per-project clone token (git credential override) ────────────────── */

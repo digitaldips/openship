@@ -503,7 +503,7 @@ export function useDeploymentConfig() {
       context?: { branch?: string; projectId?: string },
     ): Promise<{ success: boolean; error?: string; errorType?: string; buildInProgress?: boolean }> => {
       try {
-        let project: Record<string, any> | null = null;
+        let project: PersistedProject = null;
 
         if (context?.projectId) {
           const projectResponse = await projectsApi.getInfo(context.projectId);
@@ -580,7 +580,7 @@ export function useDeploymentConfig() {
       context?: { projectId?: string },
     ): Promise<{ success: boolean; error?: string; errorType?: string }> => {
       try {
-        let project: Record<string, any> | null = null;
+        let project: PersistedProject = null;
 
         if (context?.projectId) {
           const projectResponse = await projectsApi.getInfo(context.projectId);
