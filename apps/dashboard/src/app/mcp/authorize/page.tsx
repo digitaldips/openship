@@ -10,8 +10,11 @@
  * (`{ accept, consent_code }`) — which returns a `redirectURI` that continues
  * the flow back to the client.
  *
- * Lives top-level (not under (auth)) because it's for an AUTHENTICATED visitor;
- * we wrap AuthShell manually for visual parity with /login and /cloud-authorize.
+ * Lives top-level (not under (auth)/(dashboard)) because it's for an
+ * AUTHENTICATED visitor; we wrap AuthShell manually for visual parity with
+ * /login and /cloud-authorize. Since it's outside the dashboard layout there's
+ * no PlatformProvider — the SaaS-vs-self-hosted split for the resource picker
+ * comes from the `useDeploymentInfo` hook instead of `usePlatform`.
  */
 
 import { Suspense, useCallback, useMemo, useState } from "react";
@@ -22,7 +25,7 @@ import { AuthShell } from "@/components/auth-shell";
 import { Button } from "@/components/ui/button";
 import { ResourcePicker } from "@/components/permissions/ResourcePicker";
 import { tokensApi, type PickerGrant, type ResourceType } from "@/lib/api";
-import { usePlatform } from "@/context/PlatformContext";
+import { useDeploymentInfo } from "@/hooks/useDeploymentInfo";
 
 function buildReturnTo(searchParams: URLSearchParams): string {
   const qs = searchParams.toString();
@@ -48,12 +51,18 @@ async function postConsent(accept: boolean, consentCode: string | null): Promise
   return res.data?.redirectURI ?? null;
 }
 
+/** Grantable resource types for the current mode. SaaS has no servers/mail
+ *  servers; self-hosted has no cloud billing. Mirrors the PAT scope picker. */
+function grantableTypes(selfHosted: boolean): ResourceType[] {
+  return selfHosted
+    ? ["project", "server", "mail_server", "backup_destination", "audit", "github_installation", "github_repository"]
+    : ["project", "backup_destination", "billing", "audit", "github_installation", "github_repository"];
+}
+
 function McpAuthorizeInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { data: session, isPending } = useSession();
-
-  const { selfHosted } = usePlatform();
 
   const clientId = searchParams.get("client_id");
   const scope = searchParams.get("scope") ?? "";
@@ -68,9 +77,8 @@ function McpAuthorizeInner() {
   // client to exactly those (leave empty → it acts with your full access).
   const [readOnly, setReadOnly] = useState(true);
   const [grants, setGrants] = useState<PickerGrant[]>([]);
-  const availableTypes: ResourceType[] = selfHosted
-    ? ["project", "server", "mail_server", "backup_destination", "audit", "github_installation", "github_repository"]
-    : ["project", "backup_destination", "billing", "audit", "github_installation", "github_repository"];
+
+  const selfHosted = useDeploymentInfo()?.selfHosted ?? true;
 
   const act = useCallback(
     async (accept: boolean) => {
@@ -189,7 +197,7 @@ function McpAuthorizeInner() {
           <ResourcePicker
             value={grants}
             onChange={setGrants}
-            availableTypes={availableTypes}
+            availableTypes={grantableTypes(selfHosted)}
             defaultPermissions={["read"]}
             disabled={submitting !== null}
           />
