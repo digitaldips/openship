@@ -13,6 +13,8 @@ import { resolvePlatformConfig } from "./lib/controller-helpers";
 import { runWithRequestStore } from "./lib/request-store";
 
 import { authRoutes } from "./modules/auth/auth.routes";
+import { auth } from "./lib/auth";
+import { oAuthDiscoveryMetadata, oAuthProtectedResourceMetadata } from "better-auth/plugins";
 import { projectRoutes } from "./modules/projects/project.routes";
 import { deploymentRoutes } from "./modules/deployments/deployment.routes";
 import { domainRoutes } from "./modules/domains/domain.routes";
@@ -49,6 +51,9 @@ import { repos } from "@repo/db";
 await initPlatform(resolvePlatformConfig());
 
 export const app = new Hono();
+
+const oauthAuthServerMetadata = oAuthDiscoveryMetadata(auth);
+const oauthProtectedResourceMetadata = oAuthProtectedResourceMetadata(auth);
 
 /* ---------- Global middleware ---------- */
 app.use(
@@ -119,6 +124,13 @@ app.route("/api/webhooks/backup", backupWebhookRoutes);
 app.route("/api/audit", auditRoutes);
 app.route("/api/permissions", permissionsRoutes);
 app.route("/api/notifications", notificationsRoutes);
+
+/* ---------- OAuth 2.1 discovery (MCP) ---------- */
+// The mcp() plugin serves these under /api/auth, but MCP/OAuth 2.1 clients look
+// for them at the ORIGIN ROOT. Re-serve the plugin's own metadata handlers here
+// so `Authorization`-less requests to /api/mcp can be discovered end-to-end.
+app.get("/.well-known/oauth-authorization-server", (c) => oauthAuthServerMetadata(c.req.raw));
+app.get("/.well-known/oauth-protected-resource", (c) => oauthProtectedResourceMetadata(c.req.raw));
 
 /* ---------- OAuth callback landing pages ---------- */
 const authCallbackHtml = `<!DOCTYPE html><html><head><title>Success</title></head><body><script>window.close();</script><p>Authentication successful. You can close this window.</p></body></html>`;

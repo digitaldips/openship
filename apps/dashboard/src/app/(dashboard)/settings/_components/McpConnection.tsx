@@ -2,13 +2,13 @@
 
 /**
  * MCP connection card. Shows the JSON-RPC endpoint for the current runtime
- * target and a ready-to-paste client config. Auth is a Personal Access Token
- * (the card just above) — no separate credential.
+ * target. Primary path is OAuth (clients discover + authorize in the browser);
+ * a Personal Access Token is the fallback for clients without OAuth.
  */
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Boxes, Copy, Check } from "lucide-react";
+import { Boxes, Copy, Check, ShieldCheck } from "lucide-react";
 import { SettingsSection } from "./SettingsSection";
 import { getRestApiBaseUrl } from "@/lib/api/urls";
 
@@ -91,27 +91,37 @@ export function McpConnection() {
       iconColor="text-emerald-500"
     >
       <div className="space-y-4">
+        {/* OAuth is the primary path: the client discovers + authorizes itself. */}
+        <div className="flex gap-2.5 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.06] p-3">
+          <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-500" />
+          <div className="text-xs leading-relaxed text-muted-foreground">
+            <span className="font-medium text-foreground">Paste the endpoint below into your MCP client</span>{" "}
+            (Claude, Cursor, …) — it opens a browser window where you approve access and choose what the client can
+            reach. No token to copy. Openship is a standards-compliant OAuth 2.1 MCP server.
+          </div>
+        </div>
+
         <div>
           <p className="mb-1.5 text-xs font-medium text-foreground">Endpoint</p>
           <CopyRow value={endpoint} />
           <p className="mt-1.5 text-xs text-muted-foreground">
-            Streamable-HTTP JSON-RPC. Authenticate with a Bearer access token — create one in the{" "}
+            Streamable-HTTP JSON-RPC. OAuth-capable clients authorize in the browser; on approval you pick
+            read-only + which resources the client may access.
+          </p>
+        </div>
+
+        <div>
+          <p className="mb-1.5 text-xs font-medium text-foreground">Without OAuth (static token)</p>
+          <CopyBlock value={configSnippet} />
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            For clients that don&apos;t support OAuth — or for a fixed, scoped token — create one in the{" "}
             <Link
               href="/settings?tab=tokens"
               className="font-medium text-foreground underline underline-offset-2 hover:text-primary"
             >
               Tokens
             </Link>{" "}
-            tab. A read-only token limits the agent to reads.
-          </p>
-        </div>
-
-        <div>
-          <p className="mb-1.5 text-xs font-medium text-foreground">Client config</p>
-          <CopyBlock value={configSnippet} />
-          <p className="mt-1.5 text-xs text-muted-foreground">
-            Replace <code className="font-mono">opsh_pat_…</code> with your token. Works from any MCP client that
-            supports an HTTP server URL with headers.
+            tab and replace <code className="font-mono">opsh_pat_…</code>. A read-only token limits the agent to reads.
           </p>
         </div>
       </div>

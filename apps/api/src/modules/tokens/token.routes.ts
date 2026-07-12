@@ -18,5 +18,6 @@ const r = secureRouter(new Hono(), {
 r.get("/", { tag: "settings:read" }, ctrl.list);
 r.post("/", { tag: "settings:write" }, tbValidator("json", CreateTokenBody), ctrl.create);
 r.delete("/:id", { tag: "settings:write" }, ctrl.revoke);
+r.post("/mcp-authorize", { tag: "settings:write" }, ctrl.authorizeMcpClient);
 
 export const tokenRoutes = r.hono;

@@ -14,6 +14,14 @@ const nextConfig = {
   // fails at runtime with "cannot find module".
   outputFileTracingRoot: path.resolve(__dirname, "../.."),
   transpilePackages: ["@repo/ui", "@repo/core"],
+  // Serve each doc as raw markdown at `/docs/<slug>.md` (llms.txt convention) —
+  // rewritten to the `docs-raw` route handler, which emits text/markdown.
+  async rewrites() {
+    return [
+      { source: "/docs.md", destination: "/docs-raw" },
+      { source: "/docs/:slug*.md", destination: "/docs-raw/:slug*" },
+    ];
+  },
   turbopack: {
     root: path.resolve(__dirname, "../.."),
     resolveAlias: {

@@ -139,3 +139,72 @@ export async function revoke(c: Context) {
   if (!ok) return c.json({ error: "Token not found" }, 404);
   return c.json({ data: { revoked: true } });
 }
+
+/**
+ * POST /api/tokens/mcp-authorize — record what an OAuth MCP client may access,
+ * BEFORE the Better Auth consent completes and a token is issued.
+ *
+ * Called by the /mcp/authorize consent page (browser cookie session). Persists
+ * the user's chosen read-only + resource grants as the OAuth client's binding
+ * (a scoped `personal_access_token` grant-holder keyed by user+client). The
+ * OAuth access token then resolves to that binding at auth time
+ * (`tryOAuthMcpAuth`) and runs through the SAME scoped-principal path as a PAT.
+ *
+ * Grants are validated ⊆ the caller's own access (identical rule to token
+ * creation), so a client can never be granted more than the user holds.
+ */
+export async function authorizeMcpClient(c: Context) {
+  const ctx = getRequestContext(c);
+  const body = await c.req.json<{
+    clientId?: string;
+    readOnly?: boolean;
+    grants?: Array<{ resourceType: string; resourceId: string; permissions: Permission[] }>;
+  }>();
+
+  const clientId = body.clientId?.trim();
+  if (!clientId) return c.json({ error: "clientId required", code: "CLIENT_ID_REQUIRED" }, 400);
+
+  const grants = (body.grants ?? []).filter((g) => g.permissions.length > 0);
+  const scoped = grants.length > 0;
+
+  for (const g of grants) {
+    if (!GRANTABLE_TOKEN_TYPES.has(g.resourceType)) {
+      return c.json(
+        { error: `Invalid resource type: ${g.resourceType}`, code: "INVALID_RESOURCE_TYPE" },
+        400,
+      );
+    }
+    if (!(await minterHasAccess(ctx, g))) {
+      return c.json(
+        {
+          error: `You can't grant access you don't have yourself: ${g.resourceType} / ${g.resourceId}`,
+          code: "GRANT_EXCEEDS_ACCESS",
+        },
+        403,
+      );
+    }
+  }
+
+  const binding = await repos.personalAccessToken.upsertOAuthBinding({
+    userId: ctx.userId,
+    organizationId: ctx.organizationId,
+    oauthClientId: clientId,
+    readOnly: body.readOnly ?? false,
+    scoped,
+  });
+
+  // Replace the binding's grants wholesale (re-authorizing overwrites).
+  await repos.patGrant.deleteByToken(binding.id);
+  if (scoped) {
+    await repos.patGrant.createMany(
+      binding.id,
+      grants.map((g) => ({
+        resourceType: g.resourceType as never,
+        resourceId: g.resourceId,
+        permissions: g.permissions,
+      })),
+    );
+  }
+
+  return c.json({ data: { ok: true, scoped, readOnly: binding.readOnly } });
+}

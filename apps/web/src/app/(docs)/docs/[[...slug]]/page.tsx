@@ -1,4 +1,5 @@
 import { docsSource } from "@/lib/source";
+import { SITE_URL } from "@/lib/sitemap-builder";
 import { getMDXComponents } from "@/mdx-components";
 import {
   DocsPage,
@@ -60,6 +61,10 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
     description,
     openGraph: { title, description, url: page.url, siteName: "Openship", type: "article" },
     twitter: { card: "summary_large_image", title, description },
-    alternates: { canonical: page.url },
+    // Advertise the raw-markdown variant (llms.txt convention) alongside canonical.
+    alternates: {
+      canonical: page.url,
+      types: { "text/markdown": `${SITE_URL}${page.url}.md` },
+    },
   };
 }

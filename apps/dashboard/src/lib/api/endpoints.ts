@@ -112,6 +112,7 @@ export const endpoints = {
   tokens: {
     list: "tokens",
     item: (id: string) => `tokens/${encodeURIComponent(id)}`,
+    mcpAuthorize: "tokens/mcp-authorize",
   },
 
   /* ---------------------------------------------------------------- */

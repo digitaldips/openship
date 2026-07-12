@@ -10,6 +10,7 @@ import { repos } from "@repo/db";
 import { secureRouter } from "../../lib/secure-router";
 import { hashPatToken } from "../../lib/pat";
 import { isPatToken, parseBearerToken } from "../../lib/bearer";
+import { auth } from "../../lib/auth";
 import { handleMcpMessage, jsonRpcError } from "./mcp-server";
 
 const r = secureRouter(new Hono(), { module: "mcp", basePath: "/api/mcp" });
@@ -24,16 +25,32 @@ r.public("get", "/", { reason: PUBLIC_REASON }, (c) => c.body(null, 405));
 // run a DB lookup, so cap them well below the default-anon rate.
 r.public("post", "/", { reason: PUBLIC_REASON, rateLimit: "auth-tight" }, async (c) => {
   const token = parseBearerToken(c);
-  if (!isPatToken(token)) {
-    return c.json(jsonRpcError(null, -32001, "Missing access token"), 401);
-  }
 
-  // Gate the whole endpoint on a valid PAT (tool calls re-validate + apply the
-  // read-only gate when they dispatch through authMiddleware).
-  const pat = await repos.personalAccessToken.findActiveByHash(hashPatToken(token));
-  if (!pat) {
-    return c.json(jsonRpcError(null, -32001, "Invalid or expired access token"), 401);
+  // Resource-server 401: a missing/invalid credential returns 401 with a
+  // `WWW-Authenticate` header pointing at the Protected Resource Metadata, so
+  // OAuth-2.1 MCP clients discover the authorization server and start the flow.
+  const unauthorized = () =>
+    c.json(jsonRpcError(null, -32001, "Missing or invalid access token"), 401, {
+      "WWW-Authenticate": `Bearer resource_metadata="${new URL(c.req.url).origin}/.well-known/oauth-protected-resource"`,
+    });
+
+  if (!token) return unauthorized();
+
+  // Accept BOTH credentials: a PAT (API-key path) or an OAuth access token
+  // (mcp() plugin). This is only a shallow gate — the real per-tool
+  // authorization runs on the dispatched sub-request through authMiddleware
+  // (which now resolves either credential; see tryPatAuth / tryOAuthMcpAuth).
+  let authed = false;
+  if (isPatToken(token)) {
+    authed = !!(await repos.personalAccessToken.findActiveByHash(hashPatToken(token)));
+  } else {
+    try {
+      authed = !!(await auth.api.getMcpSession({ headers: c.req.raw.headers }));
+    } catch {
+      authed = false;
+    }
   }
+  if (!authed) return unauthorized();
 
   let payload: unknown;
   try {

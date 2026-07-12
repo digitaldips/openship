@@ -1,4 +1,4 @@
-import { pgTable, text, boolean, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, text, boolean, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
 
 /**
  * Personal Access Token — a revocable, per-user Bearer credential for
@@ -32,6 +32,16 @@ export const personalAccessToken = pgTable(
      * token acts with the owning user's full role (legacy behavior).
      */
     scoped: boolean("scoped").notNull().default(false),
+    /**
+     * When set, this row is NOT a user-facing manual token — it's the grant
+     * holder for an OAuth MCP client binding, keyed by (userId, oauthClientId).
+     * It carries the read-only flag + scoped grants a user chose at OAuth
+     * consent, so an OAuth-authorized MCP client runs through the exact same
+     * scoped-principal path (`tokenScope` + personal_access_token_grant) as a
+     * manual scoped PAT. Never has a real plaintext token; excluded from the
+     * manual PAT list.
+     */
+    oauthClientId: text("oauth_client_id"),
     expiresAt: timestamp("expires_at"),
     lastUsedAt: timestamp("last_used_at"),
     revokedAt: timestamp("revoked_at"),
@@ -40,5 +50,9 @@ export const personalAccessToken = pgTable(
   (t) => [
     index("personal_access_token_user_idx").on(t.userId),
     index("personal_access_token_prefix_idx").on(t.tokenPrefix),
+    // One binding row per (user, OAuth client). NULL oauth_client_id (every
+    // manual PAT) is distinct under Postgres unique semantics, so manual tokens
+    // are unaffected.
+    uniqueIndex("personal_access_token_oauth_binding_idx").on(t.userId, t.oauthClientId),
   ],
 );

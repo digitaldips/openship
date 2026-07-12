@@ -30,4 +30,10 @@ export const tokensApi = {
     grants?: PickerGrant[];
   }) => api.post<{ data: CreatedAccessToken }>(endpoints.tokens.list, body),
   revoke: (id: string) => api.delete<{ data: { revoked: boolean } }>(endpoints.tokens.item(id)),
+  /** Record an OAuth MCP client's scope (read-only + resource grants) at consent. */
+  mcpAuthorize: (body: { clientId: string; readOnly: boolean; grants: PickerGrant[] }) =>
+    api.post<{ data: { ok: boolean; scoped: boolean; readOnly: boolean } }>(
+      endpoints.tokens.mcpAuthorize,
+      body,
+    ),
 };

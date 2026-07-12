@@ -16,6 +16,7 @@ import { useRouter } from "next/navigation";
 import { useI18n } from "@/components/i18n-provider";
 import { Plus, Search, Server } from "lucide-react";
 import { PageContainer } from "@/components/ui/PageContainer";
+import { usePlatform } from "@/context/PlatformContext";
 
 export default function ProjectsPage() {
   const { t } = useI18n();
@@ -24,6 +25,7 @@ export default function ProjectsPage() {
   const [filter, setFilter] = useState<ProjectFilter>({ kind: "all" });
   const [isLoading, setIsLoading] = useState(true);
   const router = useRouter();
+  const { selfHosted } = usePlatform();
   const isLoadingRef = useRef(false);
 
   useEffect(() => {
@@ -158,13 +160,28 @@ export default function ProjectsPage() {
                       Connect a server over SSH to run projects on your own infrastructure
                       alongside Openship Cloud.
                     </p>
-                    <Link
-                      href="/servers/new"
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-muted/50 text-foreground text-[13px] font-medium transition-colors hover:bg-muted"
-                    >
-                      <Plus className="size-3.5" />
-                      Connect a server
-                    </Link>
+                    {/* SSH servers are a self-hosted/desktop capability — the SaaS
+                        can't connect one, so send cloud users to the download page
+                        to get the app that can. Self-hosted/desktop use the real flow. */}
+                    {selfHosted ? (
+                      <Link
+                        href="/servers/new"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-muted/50 text-foreground text-[13px] font-medium transition-colors hover:bg-muted"
+                      >
+                        <Plus className="size-3.5" />
+                        Connect a server
+                      </Link>
+                    ) : (
+                      <a
+                        href="https://openship.io/download"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-muted/50 text-foreground text-[13px] font-medium transition-colors hover:bg-muted"
+                      >
+                        <Plus className="size-3.5" />
+                        Connect a server
+                      </a>
+                    )}
                   </div>
                 )}
               </div>

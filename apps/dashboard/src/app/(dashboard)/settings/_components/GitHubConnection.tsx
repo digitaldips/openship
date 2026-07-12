@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Github,
   ExternalLink,
@@ -64,10 +64,34 @@ export function GitHubConnection() {
     void loadStatus();
   }, [loadStatus]);
 
+  // Connect/install opens a separate window (OAuth popup or the GitHub App
+  // install tab). The connect call returns as soon as that window opens, so
+  // the immediate loadStatus below is stale. Arm this flag on click and
+  // re-pull the card's own status when the settings window regains focus —
+  // i.e. when the connect window closes / the user comes back.
+  const pendingConnectRef = useRef(false);
+  useEffect(() => {
+    const repullIfPending = () => {
+      if (!pendingConnectRef.current) return;
+      pendingConnectRef.current = false;
+      void loadStatus(true);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") repullIfPending();
+    };
+    window.addEventListener("focus", repullIfPending);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("focus", repullIfPending);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loadStatus]);
+
   // Re-fetch the App status after a connect/disconnect so the card reflects
   // the change without depending on the gh-first library refresh.
   const connect = useCallback(
     async (source?: "oauth" | "cli") => {
+      pendingConnectRef.current = true; // re-pull when the connect window closes
       await ctxConnect(source);
       await loadStatus(true);
     },
@@ -201,6 +225,9 @@ export function GitHubConnection() {
                   href={installUrl}
                   target="_blank"
                   rel="noopener noreferrer"
+                  onClick={() => {
+                    pendingConnectRef.current = true; // re-pull when the install tab closes
+                  }}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-foreground bg-muted/40 hover:bg-muted/60 rounded-lg border border-border/50 transition-colors"
                 >
                   <Download className="size-3.5" />

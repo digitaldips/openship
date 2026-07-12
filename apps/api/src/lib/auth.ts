@@ -1,7 +1,7 @@
 import { betterAuth, type User } from "better-auth";
 import { APIError } from "better-auth/api";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { bearer } from "better-auth/plugins";
+import { bearer, mcp } from "better-auth/plugins";
 import { organization } from "better-auth/plugins/organization";
 import { defaultStatements } from "better-auth/plugins/organization/access";
 import { createAccessControl } from "better-auth/plugins/access";
@@ -105,6 +105,9 @@ export const auth = betterAuth({
       organization: schema.organization,
       member: schema.member,
       invitation: schema.invitation,
+      oauthApplication: schema.oauthApplication,
+      oauthAccessToken: schema.oauthAccessToken,
+      oauthConsent: schema.oauthConsent,
     },
   }),
 
@@ -282,6 +285,32 @@ export const auth = betterAuth({
      * want since the local DB stores the raw session.token.
      */
     bearer(),
+
+    /**
+     * MCP OAuth 2.1 authorization server. Turns Openship into a standards-
+     * compliant remote MCP server: discovery-based clients (Claude, Cursor)
+     * self-register (DCR), run the PKCE authorize flow, hit our consent page,
+     * and receive an OAuth access token. That token is then bridged into the
+     * SAME scoped-principal permission model a scoped PAT uses (see
+     * `tryOAuthMcpAuth` in middleware/auth.ts) — no duplicated authorization.
+     *
+     * Endpoints mounted under /api/auth: /.well-known/oauth-authorization-server,
+     * /.well-known/oauth-protected-resource, /mcp/{authorize,token,register,
+     * get-session}, /oauth2/consent. Discovery is re-served at the origin root
+     * in app.ts (the spec expects it there, not under /api/auth).
+     *
+     * PATs remain the API-key path for REST/CLI and still authenticate /api/mcp.
+     */
+    mcp({
+      loginPage: `${runtimeTarget.dashboard}/login`,
+      oidcConfig: {
+        loginPage: `${runtimeTarget.dashboard}/login`,
+        consentPage: `${runtimeTarget.dashboard}/mcp/authorize`,
+        requirePKCE: true, // OAuth 2.1
+        storeClientSecret: "hashed",
+        allowDynamicClientRegistration: true, // MCP clients self-register
+      },
+    }),
 
     /**
      * Multi-user / multi-team via Better Auth's first-party organization

@@ -1,0 +1,96 @@
+---
+title: MCP
+description: Connect AI agents to your Openship instance over the Model Context Protocol.
+---
+
+Openship exposes a **Model Context Protocol (MCP)** endpoint so AI agents (Claude, Cursor, and any MCP-compatible client) can manage your deployments, projects, and infrastructure as tools. It's the same permission model as the REST API — an agent only ever sees what its token is allowed to.
+
+## Endpoint
+
+```
+POST /api/mcp
+```
+
+- **Openship Cloud:** `https://api.openship.io/api/mcp`
+- **Self-hosted:** `https://<your-api-host>/api/mcp`
+
+It's a stateless **Streamable-HTTP JSON-RPC 2.0** endpoint. It's `POST`-only — a `GET` returns `405` (there's no server→client streaming), and JSON-RPC batching is not supported.
+
+Settings → **MCP** in the dashboard always shows the exact URL for your instance, plus a ready-to-paste client config.
+
+## Connecting
+
+There are two ways to authenticate, and most clients pick automatically:
+
+### OAuth (recommended — auto-discovery)
+
+Openship is a standards-compliant **OAuth 2.1** MCP server. Clients that support it (Claude, Cursor, …) just take the endpoint URL and handle the rest: an unauthenticated request gets a `401` pointing at `/.well-known/oauth-protected-resource`, the client registers itself dynamically, runs the PKCE authorize flow, and you approve it on a consent screen in your browser. No copy-pasting credentials.
+
+On that consent screen you choose exactly what the client may do — **read-only** and/or a specific set of projects, servers, and repositories. That scope is enforced through the same grant model as a scoped Personal Access Token: the client can never exceed what you granted, or what you can access yourself.
+
+In a client that asks for an MCP server URL, just give it:
+
+```
+https://api.openship.io/api/mcp
+```
+
+### Personal Access Token (manual / API-key)
+
+For clients without OAuth support — or for a narrowly-scoped, long-lived token — authenticate with a PAT as a bearer credential.
+
+## Authentication
+
+Authenticate with a **Personal Access Token** as a bearer credential — there's no separate MCP credential:
+
+```
+Authorization: Bearer opsh_pat_…
+```
+
+Create one under Settings → **Tokens**. Every tool call re-runs the full permission stack, so the token's limits are enforced on each request:
+
+- **Read-only** token → the agent can only call read tools.
+- **Scoped** token → the agent is confined to exactly the projects, servers, and repositories you grant it, even below your own role.
+
+For agents, mint a **narrow, scoped (or read-only) token** rather than handing over your full access.
+
+## Client config
+
+Any MCP client that accepts an HTTP server URL with headers:
+
+```json
+{
+  "mcpServers": {
+    "openship": {
+      "url": "https://api.openship.io/api/mcp",
+      "headers": { "Authorization": "Bearer opsh_pat_…" }
+    }
+  }
+}
+```
+
+### Claude Code
+
+```bash
+claude mcp add --transport http openship https://api.openship.io/api/mcp \
+  --header "Authorization: Bearer opsh_pat_…"
+```
+
+Swap the URL for your own host if you're self-hosting, and replace the token.
+
+## Verify
+
+```bash
+curl -s https://api.openship.io/api/mcp \
+  -H "Authorization: Bearer opsh_pat_…" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+This returns the list of tools the token can use.
+
+- `401 Invalid or expired access token` → the token is wrong or revoked.
+- A `tools/list` that succeeds but a specific `tools/call` returns `404` for a resource → that's the token's scope doing its job: it wasn't granted that resource.
+
+## Available tools
+
+Tools are derived from Openship's permission-tagged API routes, so the set an agent sees matches its token's permissions. Call `tools/list` to enumerate exactly what a given token can do.
