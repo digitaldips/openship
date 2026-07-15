@@ -54,7 +54,7 @@ r.public("get", "/", { reason: PUBLIC_REASON }, (c) => c.body(null, 405));
 
 // Same tight per-IP budget as the auth endpoints — unauthenticated PAT probes
 // run a DB lookup, so cap them well below the default-anon rate.
-r.public("post", "/", { reason: PUBLIC_REASON, rateLimit: "auth-tight" }, async (c) => {
+r.public("post", "/", { reason: PUBLIC_REASON, rateLimit: "mcp" }, async (c) => {
   const token = parseBearerToken(c);
 
   // Resource-server 401: a missing/invalid credential returns 401 with a

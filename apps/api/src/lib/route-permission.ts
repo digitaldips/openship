@@ -267,6 +267,7 @@ export type RateLimitPolicyId =
   | "default-authed"
   | "auth-tight"
   | "auth-loose"
+  | "mcp"
   | "read-authed"
   | "write-authed"
   | "webhook-ingress"

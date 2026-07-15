@@ -26,6 +26,7 @@ export type PolicyId =
   | "default-authed"
   | "auth-tight"
   | "auth-loose"
+  | "mcp"
   | "read-authed"
   | "write-authed"
   | "webhook-ingress"
@@ -68,6 +69,19 @@ export const POLICIES: Record<PolicyId, RateLimitPolicy> = {
     windowMs: MINUTE_MS,
     subject: "user",
     description: "Authed session ops (logout, refresh) — per-user.",
+  },
+
+  /** MCP JSON-RPC endpoint (/api/mcp). Per-IP because the endpoint
+   *  authenticates the PAT/OAuth credential itself (an unauthed probe still
+   *  does a DB lookup, so keep it bounded), but far higher than `auth-tight`:
+   *  a single connected client fires many requests per session (initialize +
+   *  tools/list + one per tools/call), which `auth-tight`'s 10/min throttled. */
+  "mcp": {
+    id: "mcp",
+    limit: 300,
+    windowMs: MINUTE_MS,
+    subject: "ip",
+    description: "MCP JSON-RPC endpoint — per-IP; generous for tool-call bursts.",
   },
 
   /** Read API — list, get, query. Per-user, generous. */
