@@ -34,6 +34,7 @@ import {
 import { recountDomain, validateDomain } from "./domains.service";
 import { buildInsertMailboxSql, buildInsertSelfForwardingSql } from "./platform-mailbox.service";
 import { safeErrorMessage } from "@repo/core";
+import { readState } from "../mail-state";
 
 const EMAIL_RE = /^[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z]{2,}$/;
 const LOCAL_PART_RE = /^[a-z0-9._+-]+$/;
@@ -321,16 +322,19 @@ export async function hardDeleteMailbox(serverId: string, email: string): Promis
   const existing = await getMailbox(serverId, username);
   if (!existing) throw new MailboxNotFoundError(username);
 
-  // Refuse to delete the postmaster account of the install domain. The
-  // install wizard creates it and iRedMail's own scripts expect it to
-  // exist. The UI should not even expose this option, but defence in depth.
-  if (existing.username.startsWith("postmaster@")) {
-    throw new Error(
-      `Refusing to hard-delete the postmaster mailbox (${existing.username}). Use soft delete instead.`,
-    );
-  }
-
   await sshManager.withExecutor(serverId, async (exec) => {
+    // Only the install domain's postmaster is infrastructure. Additional
+    // domains also get a postmaster mailbox, but it must remain removable so
+    // cascade deletion can empty and drop those domains.
+    if (username.startsWith("postmaster@")) {
+      const installDomain = (await readState(exec))?.domain?.toLowerCase();
+      if (!installDomain || username === `postmaster@${installDomain}`) {
+        throw new Error(
+          `Refusing to hard-delete the postmaster mailbox (${existing.username}). Use soft delete instead.`,
+        );
+      }
+    }
+
     await transaction(exec, [
       `DELETE FROM forwardings WHERE address = ${q(username)} OR forwarding = ${q(username)}`,
       `DELETE FROM used_quota WHERE username = ${q(username)}`,
