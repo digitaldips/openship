@@ -42,7 +42,6 @@ import { getLatestCommit, getRepository } from "../github/github.service";
 import { assertGitHubRepoAccess } from "../github/github-access";
 import { firePreDeployBackups } from "../backups/triggers/pre-deploy";
 import { resolveSmartRoute } from "./smart-route";
-import { getRoutingBaseDomain } from "../../lib/routing-domains";
 import { resolveProjectInfo } from "./prepare.service";
 import { getFolderSession } from "../projects/folder/session-store";
 import { type RequestContext } from "../../lib/request-context";
@@ -775,15 +774,10 @@ function defaultFreeEndpoint(project: {
   slug: string;
   hasServer: boolean;
   port: number | null;
-}): { domain: string; domainType: "custom"; port?: string; targetPath?: string } {
-  // Self-hosted fix: default the project's primary endpoint to a custom
-  // *.ship.<baseDomain> hostname instead of a free managed subdomain, so the
-  // deploy preflight never requires Openship Cloud. DNS wildcard resolves to
-  // the server, so the cloud requirement resolves to "none".
-  const host = `${project.slug}.${getRoutingBaseDomain()}`;
+}): { domain: string; domainType: "free"; port?: string; targetPath?: string } {
   return project.hasServer && project.port
-    ? { domain: host, domainType: "custom", port: String(project.port) }
-    : { domain: host, domainType: "custom", targetPath: "/" };
+    ? { domain: project.slug, domainType: "free", port: String(project.port) }
+    : { domain: project.slug, domainType: "free", targetPath: "/" };
 }
 
 export async function requestBuildAccess(ctx: RequestContext, input: BuildAccessInput) {

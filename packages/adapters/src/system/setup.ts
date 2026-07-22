@@ -54,46 +54,33 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
  *   - docker → Docker + Git + OpenResty + certbot
  *   - bare   → Git + OpenResty + certbot
  *
- * When `externalEdge` is set (a reverse proxy such as Caddy already owns
- * ingress + TLS on this host — common for self-hosted docker behind Caddy),
- * OpenResty/certbot are dropped: routing/SSL are handled externally and
- * OpenShip must NOT install its own edge (it would collide on 80/443 and,
- * on Debian trixie, the openresty apt repo 404s anyway).
- *
  * Note: Node.js / Go / Python / etc. are NOT system prerequisites.
  * They are installed on-demand by the toolchain layer (ensureToolchain)
  * based on what each stack's language requires.
  */
-function resolveRules(mode: RuntimeMode, externalEdge = false): PrerequisiteRule[] {
+function resolveRules(mode: RuntimeMode): PrerequisiteRule[] {
   if (mode === "docker") {
     return [
       { feature: "build", requires: ["git", "docker"], message: "Build requires Git and Docker" },
       { feature: "deploy", requires: ["docker"], message: "Deploy requires Docker" },
-      ...(externalEdge
-        ? []
-        : [
-            { feature: "routing", requires: ["openresty"], message: "Routing requires OpenResty" },
-            { feature: "ssl", requires: ["openresty", "certbot"], message: "SSL requires OpenResty and certbot" },
-          ]),
+      { feature: "routing", requires: ["openresty"], message: "Routing requires OpenResty" },
+      { feature: "ssl", requires: ["openresty", "certbot"], message: "SSL requires OpenResty and certbot" },
     ];
   }
 
   // bare mode - language runtimes handled per-stack by toolchain layer
   return [
     { feature: "build", requires: ["git"], message: "Build requires Git" },
-    ...(externalEdge
-      ? []
-      : [
-          { feature: "routing", requires: ["openresty"], message: "Routing requires OpenResty" },
-          { feature: "ssl", requires: ["openresty", "certbot"], message: "SSL requires OpenResty and certbot" },
-        ]),
+    { feature: "routing", requires: ["openresty"], message: "Routing requires OpenResty" },
+    { feature: "ssl", requires: ["openresty", "certbot"], message: "SSL requires OpenResty and certbot" },
   ];
 }
 
 /** Resolve which system components must be installed for a given runtime mode. */
-function resolveRequired(mode: RuntimeMode, externalEdge = false): string[] {
-  const base = mode === "docker" ? ["docker", "git"] : ["git"];
-  return externalEdge ? base : [...base, "openresty", "certbot"];
+function resolveRequired(mode: RuntimeMode): string[] {
+  return mode === "docker"
+    ? ["docker", "git", "openresty", "certbot"]
+    : ["git", "openresty", "certbot"];
 }
 
 // ─── SystemManager ───────────────────────────────────────────────────────────
@@ -113,14 +100,6 @@ export interface SystemManagerOptions {
    * on the same server. Omitted → runs unlocked (single-deploy / tests).
    */
   provisionLock?: ProvisionLock;
-  /**
-   * When true, a reverse proxy external to OpenShip (e.g. Caddy) already owns
-   * ingress + TLS on this host. OpenShip must NOT require/install OpenResty or
-   * certbot — routing/SSL are handled externally. The deploy still stamps the
-   * `openship.project` label on containers so an external sync service (Caddy)
-   * can discover and publish them.
-   */
-  externalEdge?: boolean;
 }
 
 export class SystemManager {
@@ -132,7 +111,6 @@ export class SystemManager {
   private readonly stateStore: SetupStateStore;
   private readonly installerConfig: InstallerConfig;
   private readonly provisionLock?: ProvisionLock;
-  private readonly externalEdge: boolean;
 
   /** In-memory cache to avoid even reading from disk/DB on hot paths. */
   private cachedState: SetupState | null = null;
@@ -140,9 +118,8 @@ export class SystemManager {
   constructor(mode: RuntimeMode, opts: SystemManagerOptions) {
     this.mode = mode;
     this.executor = opts.executor;
-    this.externalEdge = opts.externalEdge ?? false;
-    this.rules = resolveRules(mode, this.externalEdge);
-    this.required = resolveRequired(mode, this.externalEdge);
+    this.rules = resolveRules(mode);
+    this.required = resolveRequired(mode);
     this.stateStore = opts.stateStore ?? new FileStateStore(opts.executor);
     this.installerConfig = opts.installerConfig ?? {};
     this.provisionLock = opts.provisionLock;

@@ -416,7 +416,7 @@ export function detectStack(
 
   const stackDef = STACKS[matched] as StackDefinition;
 
-  let startCommand = getStartCommand(pm, matched, packageJson, fc);
+  let startCommand = getStartCommand(pm, matched, packageJson);
   let productionPaths = stackDef.productionPaths ? [...stackDef.productionPaths] : [];
 
   // Rust: the binary is named after the crate, not a literal "app". Derive it
@@ -731,48 +731,7 @@ export function getBuildCommand(
 }
 
 /** Start command - prefers project scripts, then falls back to registry defaults */
-/**
- * Detect a FastAPI/ASGI entrypoint module from source files. OpenShip's
- * historical default was the hardcoded `main:app`, which fails every Python
- * API whose entrypoint isn't literally `main.py` (app.py, server.py, …).
- * Scan the served file contents for an `app = FastAPI(...)` (or Starlette/
- * Quart) assignment and return that module's basename so the start command
- * becomes `<module>:app`. Returns null when nothing matches.
- */
-function detectFastApiModule(fileContents: Record<string, string> | undefined): string | null {
-  if (!fileContents) return null;
-  // Prefer a file whose name already suggests an entrypoint.
-  const preferred = ["main", "app", "server", "api", "wsgi", "asgi"];
-  const candidates: { name: string; score: number }[] = [];
-  for (const [file, content] of Object.entries(fileContents)) {
-    if (!/\.py$/.test(file)) continue;
-    if (!/=\s*(FastAPI|Starlette|Quart|Sanic)\s*\(|app\s*=\s*FastAPI/.test(content)) continue;
-    const base = file.replace(/\.py$/, "");
-    const score = preferred.includes(base) ? 0 : 1;
-    candidates.push({ name: base, score });
-  }
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => a.score - b.score);
-  return candidates[0].name;
-}
-
-export function getStartCommand(
-  pm: string,
-  stack: StackId,
-  packageJson?: Record<string, unknown>,
-  fileContents?: Record<string, string>,
-): string {
-  const stackDef = STACKS[stack];
-  const category = stackDef.category;
-
-  // Static frontends (Vite/React/Vue/Angular/Svelte/static sites) are served as
-  // files by nginx — they MUST NOT get a runtime start command, or they'd be
-  // misclassified as a server and the deploy would try to `node` a static build.
-  // Force an empty start command so static detection (isStaticService) holds.
-  if (category === "frontend" || category === "static") {
-    return "";
-  }
-
+export function getStartCommand(pm: string, stack: StackId, packageJson?: Record<string, unknown>): string {
   const scripts = (packageJson?.scripts ?? {}) as Record<string, string>;
   const runner = scriptRunner(pm);
 
@@ -783,17 +742,9 @@ export function getStartCommand(
 
   // Main field in package.json
   const main = packageJson?.main as string | undefined;
-  const lang = stackDef.language;
+  const lang = STACKS[stack].language;
   if (main && (lang === "javascript" || lang === "typescript")) {
     return `node ${main}`;
-  }
-
-  // Python/FastAPI: auto-detect the real ASGI module instead of assuming main.
-  if (lang === "python" && category === "backend") {
-    const mod = detectFastApiModule(fileContents);
-    if (mod) {
-      return `uvicorn ${mod}:app --host 0.0.0.0 --port 8000`;
-    }
   }
 
   // JVM Gradle output lands in build/libs; Maven keeps the registry default
@@ -803,5 +754,5 @@ export function getStartCommand(
   }
 
   // Fall back to the registry default
-  return stackDef.defaultStartCommand;
+  return STACKS[stack].defaultStartCommand;
 }

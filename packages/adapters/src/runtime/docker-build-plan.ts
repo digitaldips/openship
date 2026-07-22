@@ -216,41 +216,10 @@ function generateStaticDockerfile(config: BuildConfig): string {
   return lines.join("\n");
 }
 
-// Frameworks whose deploy is a STATIC file build (served by nginx), never a
-// long-running server. Mirrors packages/core stacks.ts categories "frontend"/
-// "static" for the web frameworks OpenShip classifies as static SPAs. Keeping
-// this list on the adapters side avoids a core import cycle and lets the
-// generated Dockerfile force the static (nginx) recipe even if a start command
-// somehow leaked through detection.
-const STATIC_SPA_FRAMEWORKS = new Set<string>([
-  "vite",
-  "react",
-  "vue",
-  "vue-cli",
-  "angular",
-  "svelte",
-  "svelte-kit",
-  "static",
-  "astro",
-  "gatsby",
-  "11ty",
-  "pelican",
-  "jekyll",
-  "hugo",
-]);
-
-function isStaticSpaFramework(framework?: string): boolean {
-  return !!framework && STATIC_SPA_FRAMEWORKS.has(framework);
-}
-
 export function generateDockerfile(config: BuildConfig): string {
   // Static builds are served as files by a minimal nginx image (SPA fallback).
-  // Treat BOTH the explicit isStatic flag AND any known static-SPA framework as
-  // static, and ignore a leaked start command so a Vite/React/etc. sub-app is
-  // never mis-run as a node server (which would fail with `node: not found`
-  // inside a non-node runtime, or serve nothing).
-  if (config.isStatic || isStaticSpaFramework(config.framework)) {
-    return generateStaticDockerfile({ ...config, startCommand: "" });
+  if (config.isStatic) {
+    return generateStaticDockerfile(config);
   }
 
   // PHP stacks need a bespoke fpm+nginx recipe (Composer in build, nginx in

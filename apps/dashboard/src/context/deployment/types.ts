@@ -333,11 +333,7 @@ export const DEFAULT_CONFIG: DeploymentConfig = {
   localPath: undefined,
   uploadSessionId: undefined,
   buildStrategy: "server",
-  // Self-hosted default: deploy to the operator's own server (docker), not
-  // Openship Cloud. The cloud target is still selectable on desktop, but the
-  // default for self-hosted/docker installs must be "local" so the deploy
-  // wizard never forces the "Connect to Openship Cloud" gate.
-  deployTarget: "local",
+  deployTarget: "cloud",
   runtimeMode: "bare",
   projectType: "app",
   framework: "nextjs",

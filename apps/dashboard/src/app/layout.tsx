@@ -92,16 +92,9 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         {/* Set <html lang/dir> from the locale cookie BEFORE paint, so a reload
             in Arabic mirrors immediately even if SSR fell back to default —
             mirrors ThemeScript's no-flash approach. React reconciles the text. */}
-        {/* NOTE: LOCALE_COOKIE is a client-only constant (exported from the
-            "use client" i18n-provider module). Importing it into this server
-            layout and interpolating it into an inline <script> makes Next.js
-            substitute the client-reference proxy (function(){throw Error(...)}),
-            which corrupts the regex and crashes every page with
-            "missing ) after argument list". Use the literal cookie name here
-            (kept in sync with LOCALE_COOKIE in i18n-provider.tsx). */}
         <script
           dangerouslySetInnerHTML={{
-            __html: `(function(){try{var m=document.cookie.match(/(?:^|;\\s*)openship-locale=([^;]+)/);var l=m?decodeURIComponent(m[1]):(localStorage.getItem('openship-locale')||'');if(l==='ar'){document.documentElement.lang='ar';document.documentElement.dir='rtl';}else if(l==='en'){document.documentElement.lang='en';document.documentElement.dir='ltr';}}catch(e){}})();`,
+            __html: `(function(){try{var m=document.cookie.match(/(?:^|;\\s*)${LOCALE_COOKIE}=([^;]+)/);var l=m?decodeURIComponent(m[1]):(localStorage.getItem('${LOCALE_COOKIE}')||'');if(l==='ar'){document.documentElement.lang='ar';document.documentElement.dir='rtl';}else if(l==='en'){document.documentElement.lang='en';document.documentElement.dir='ltr';}}catch(e){}})();`,
           }}
         />
         {localApiOrigin ? (

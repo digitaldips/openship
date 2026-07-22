@@ -77,30 +77,6 @@ services:
       PORT: "4000"
       DATABASE_URL: postgresql://${POSTGRES_USER:-openship}:${POSTGRES_PASSWORD:-openship}@postgres:5432/${POSTGRES_DB:-openship}
       REDIS_URL: redis://redis:6379
-      # External edge: Caddy already owns ingress + TLS (self-hosted behind
-      # Caddy). OpenShip must NOT install OpenResty/certbot — routing/SSL are
-      # handled by Caddy; deployed containers are published via openship-caddy-sync
-      # from the openship.project label. Fixes the Debian-trixie OpenResty 404
-      # that blocked every avatar-tutor deploy.
-      OPENSHIP_EXTERNAL_EDGE: "true"
-    # Mount host gh config so the dashboard's "Check connection" (and local
-    # gh CLI auth) can read ~/.config/gh/hosts.yml inside the container.
-    volumes:
-      - /root/.config/gh:/root/.config/gh:ro
-      # Self-hosted "docker" deploy mode drives the HOST Docker daemon (build +
-      # run app containers on this server, never Openship Cloud). The API image
-      # ships the docker CLI; this socket + group let it reach the daemon.
-      - /var/run/docker.sock:/var/run/docker.sock
-    # gid of the host "docker" group (owner of docker.sock) so the non-root
-    # bun user can talk to the daemon.
-    group_add:
-      - "110"
-    # The control-plane runs INSIDE a container, but app containers publish their
-    # port on the HOST (random hostPort on 0.0.0.0). Give the API a route to the
-    # host so its post-deploy health check can reach the app at
-    # host.docker.internal:<hostPort> instead of its own loopback.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -120,14 +96,13 @@ services:
       dockerfile: apps/dashboard/Dockerfile
     restart: unless-stopped
     ports:
-      - "4001:3001"
+      - "3001:3001"
     env_file:
       - .env
     environment:
       NODE_ENV: production
       PORT: "3001"
       INTERNAL_API_URL: http://api:4000
-      NEXT_PUBLIC_API_PROXY: "true"
     depends_on:
       api:
         condition: service_healthy
@@ -139,7 +114,7 @@ services:
       dockerfile: apps/web/Dockerfile
     restart: unless-stopped
     ports:
-      - "4002:3000"
+      - "3000:3000"
     environment:
       NODE_ENV: production
       PORT: "3000"
