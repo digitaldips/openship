@@ -205,27 +205,18 @@ export function domainWebhookUrl(hostname: string, scheme: "http" | "https" = "h
  * Better Auth `baseURL` — the origin every absolute auth/OAuth URL (issuer,
  * authorize, token, discovery metadata, email links) is built from.
  *
- * With a public URL configured we return Better Auth's DYNAMIC config: it builds
- * the base from the request's `x-forwarded-host`/`-proto` (set by the dashboard
- * same-origin proxy) when that host is allow-listed, so a remote MCP/OAuth client
- * is handed reachable `https://<public-host>/api/auth/...` URLs instead of
- * `http://localhost:4000`. Requests without a matching forwarded host (internal
- * loopback calls, health checks) fall back to the static API URL — so this is
- * safe: routing is path-based, only CONSTRUCTED URLs change.
+ * With a public URL configured, return it as a stable static base so remote
+ * MCP/OAuth clients are handed reachable `https://<public-host>/api/auth/...`
+ * URLs instead of `http://localhost:4000`. It must be static: Better Auth
+ * materialises the OAuth authorization-server metadata at startup, with no
+ * request in scope, so a `DynamicBaseURLConfig` resolves to an empty issuer
+ * there; a discovery `issuer` also has to be stable across requests.
  *
- * Without a public URL (cloud / dev / desktop) we return the static
- * `runtimeTarget.api` exactly as before — zero behavior change.
+ * Without a public URL (cloud / dev / desktop) fall back to the static
+ * `runtimeTarget.api` — zero behavior change.
  */
-export function resolveAuthBaseUrl(): string | { allowedHosts: string[]; fallback: string } {
-  const pub = publicUrl();
-  if (!pub) return runtimeTarget.api;
-  let host: string;
-  try {
-    host = new URL(pub).host;
-  } catch {
-    return runtimeTarget.api;
-  }
-  return { allowedHosts: [host], fallback: runtimeTarget.api };
+export function resolveAuthBaseUrl(): string {
+  return publicUrl() ?? runtimeTarget.api;
 }
 
 /**

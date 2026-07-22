@@ -126,9 +126,9 @@ const envSchema = z.object({
    * Cloud-session IP/UA pinning policy. Applied by cloudSessionAuth
    * middleware when a local instance presents a cloud_session_token.
    *
-   *   - "off"  (default) → log mismatches as warnings, allow the request.
+   *   - "off"            → log mismatches as warnings, allow the request.
    *                        Friendly to mobile carriers/VPN switches.
-   *   - "warn"           → same as "off" but also emits an audit log
+   *   - "warn" (default) → same as "off" but also emits an audit log
    *                        entry per mismatch (for SOC review).
    *   - "strict"         → 401 on IP OR User-Agent mismatch with the
    *                        IP/UA stored when the session was created.
@@ -218,10 +218,9 @@ const envSchema = z.object({
 
   /* ---------- Backup destinations ---------- */
   /**
-   * Allow `kind: 'local'` backup destinations. Defaults OFF in CLOUD_MODE
-   * (the SaaS would otherwise expose its multi-tenant filesystem to any
-   * authenticated user), defaults ON for self-hosted single-operator
-   * installs where the API process owns the host.
+   * Allow `kind: 'local'` backup destinations. Defaults OFF everywhere
+   * (including self-hosted single-operator installs) - the operator must
+   * explicitly opt in with BACKUP_ALLOW_LOCAL_DESTINATION=true.
    */
   BACKUP_ALLOW_LOCAL_DESTINATION: envBool(),
   /**
