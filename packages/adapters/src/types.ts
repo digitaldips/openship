@@ -6,7 +6,7 @@
  * routing configs, and SSL results.
  */
 
-import type { BuildStrategy } from "@repo/core";
+import type { BuildStrategy, ProxySettings } from "@repo/core";
 import type { Readable, Duplex } from "node:stream";
 export type { BuildStrategy } from "@repo/core";
 
@@ -378,6 +378,11 @@ interface BaseRouteConfig {
   redirects?: RouteRedirect[];
   /** Response-header rules (vercel.json `headers`) → `add_header`. */
   headerRules?: RouteHeaderRule[];
+  /** Curated reverse-proxy tunables (client_max_body_size, proxy/body timeouts,
+   *  buffering, gzip) rendered at server scope. Effective merge of the
+   *  server default < project < service settings; persists in the route sidecar
+   *  so cert re-registration reproduces it. */
+  proxy?: ProxySettings;
 }
 
 export interface ProxyRouteConfig extends BaseRouteConfig {

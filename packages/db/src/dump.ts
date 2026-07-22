@@ -95,6 +95,31 @@ function resolvePgError(err: unknown): (Error & { code?: string }) | null {
   return null;
 }
 
+/**
+ * Drop the keys of a dumped row that THIS build's schema doesn't model, so a
+ * version-skewed dump ingests cleanly. Drizzle derives the INSERT column list
+ * from the row's keys, so a column present on a NEWER sender but absent on this
+ * (older) receiver would make Postgres reject the whole insert ("column X of
+ * relation Y does not exist"). Filtering to `knownCols` (the receiver's columns)
+ * removes exactly those — the receiver can't store what it doesn't model anyway.
+ * The reverse skew (receiver has a column the dump lacks) is handled by Drizzle
+ * emitting DEFAULT, which is why additive migrations MUST be nullable/defaulted.
+ *
+ * Exported for the version-skew tolerance test. Pure — no DB access.
+ */
+export function filterRowToKnownColumns(
+  row: Record<string, unknown>,
+  knownCols: ReadonlySet<string>,
+): { row: Record<string, unknown>; dropped: string[] } {
+  const next: Record<string, unknown> = {};
+  const dropped: string[] = [];
+  for (const [k, v] of Object.entries(row)) {
+    if (knownCols.has(k)) next[k] = v;
+    else dropped.push(k);
+  }
+  return { row: next, dropped };
+}
+
 // ─── Table catalogue ─────────────────────────────────────────────────────────
 //
 // One declarative table per row. `scopes` describes which subgraphs include
@@ -670,21 +695,39 @@ export async function restoreSubgraph(
       const encryptedCols = encryptedByTable.get(spec.sqlName);
       const colMeta = encryptedCols ? columnMetaFor(spec.sqlName) : {};
 
+      // The set of columns THIS build's schema knows for the table. `prepared`
+      // is filtered to it below so a version-skewed dump ingests cleanly:
+      //   - sender NEWER than receiver → a column the receiver lacks would make
+      //     Postgres reject the whole insert ("column X of relation Y does not
+      //     exist"), because Drizzle derives the INSERT column list from the
+      //     row's keys. Dropping the unknown key lets the row land (the receiver
+      //     can't store what it doesn't model anyway).
+      //   - sender OLDER than receiver → a column the receiver added is simply
+      //     absent from the row; Drizzle emits DEFAULT for it. Safe ONLY if that
+      //     column is nullable or has a default — the additive-migration rule.
+      // This is the cross-version robustness that DUMP_FORMAT_VERSION (bumped
+      // only on breaking shape changes) deliberately does not cover for plain
+      // column additions.
+      const columns = getTableColumns(spec.table);
+      const knownCols = new Set(Object.keys(columns));
+
       // Timestamp/date columns arrive as ISO strings whenever the dump crossed
       // the wire as JSON (cloud ingest, project transfer) — JSON.stringify turns
       // a Date into a string, and Drizzle's timestamp mapToDriverValue then calls
       // `.toISOString()` on it and throws. Revive them to Date before insert.
       // (In-process restores keep real Dates and skip the `typeof === string`
       // branch, so this is a no-op there.)
-      const dateCols = Object.entries(getTableColumns(spec.table))
+      const dateCols = Object.entries(columns)
         .filter(([, col]) => (col as { dataType?: string }).dataType === "date")
         .map(([name]) => name);
 
-      // Shallow-clone each row so we don't mutate the caller's input dump.
-      // redactEncryptedCell deep-clones any nested JSONB it edits (secretPaths),
-      // so a top-level `{ ...r }` is enough here.
+      // Shallow-clone each row (filtered to known columns) so we don't mutate the
+      // caller's input dump. redactEncryptedCell deep-clones any nested JSONB it
+      // edits (secretPaths), so a top-level copy is enough here.
+      const droppedCols = new Set<string>();
       const prepared = rows.map((r) => {
-        const next: Record<string, unknown> = { ...r };
+        const { row: next, dropped } = filterRowToKnownColumns(r, knownCols);
+        for (const d of dropped) droppedCols.add(d);
         if (opts.remapOrgId && spec.hasOrganizationId) {
           next.organizationId = opts.remapOrgId;
         }
@@ -696,6 +739,13 @@ export async function restoreSubgraph(
         }
         return next;
       });
+      if (droppedCols.size > 0) {
+        // Version skew, not a fault — the receiver's schema predates these
+        // columns. Log once per table so it's diagnosable without failing.
+        console.warn(
+          `[restore] ${spec.sqlName}: dropped ${droppedCols.size} unknown column(s) not in this build's schema: ${[...droppedCols].join(", ")}`,
+        );
+      }
 
       // Shared parents (e.g. project_app, which owns many project environments
       // via the `from-root-project` resolver) may already exist on the target
@@ -723,6 +773,18 @@ export async function restoreSubgraph(
         const pg = resolvePgError(err);
         if (pg?.code === "23505") {
           throw new PkCollisionError(spec.sqlName, pg);
+        }
+        // Drizzle's top-level `.message` is only the "Failed query: … params:"
+        // wrapper; the actual reason (column/constraint/detail) lives on the pg
+        // cause. Re-throw with that reason in the message so it survives error
+        // serialization to the transfer/ingest caller and reaches the operator,
+        // instead of the useless wrapper. Keep the original as `cause`.
+        if (pg) {
+          const detail = (pg as { detail?: string }).detail;
+          throw new Error(
+            `restore ${spec.sqlName}: ${pg.message}${pg.code ? ` [${pg.code}]` : ""}${detail ? ` (${detail})` : ""}`,
+            { cause: err },
+          );
         }
         throw err;
       }

@@ -23,20 +23,6 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 FROM oven/bun:latest AS runner
 WORKDIR /app
 
-# Install SSH client for server connections, curl (used by system-component
-# checks), git (the monorepo/docker build path shells out to `git` to assemble
-# the app), and the Docker CLI so local "docker" deploys can drive the host
-# daemon via the mounted /var/run/docker.sock (self-hosted deploy mode).
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client curl ca-certificates gnupg git \
-  && install -m 0755 -d /etc/apt/keyrings \
-  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
-  && chmod a+r /etc/apt/keyrings/docker.asc \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" > /etc/apt/sources.list.d/docker.list \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
-  && rm -rf /var/lib/apt/lists/*
-
 # @repo/* are TypeScript-SOURCE workspace packages (package.json main =
 # src/index.ts) resolved via the ROOT package.json "workspaces" field — there
 # is NO node_modules/@repo; bun points straight at packages/*. tsup externalizes

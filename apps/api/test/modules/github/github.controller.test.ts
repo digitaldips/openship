@@ -65,6 +65,7 @@ describe("connectRedirect", () => {
       body: {
         provider: "github",
         callbackURL: "/auth/callback/close",
+        errorCallbackURL: "/auth/callback/close",
         disableRedirect: true,
       },
       headers,

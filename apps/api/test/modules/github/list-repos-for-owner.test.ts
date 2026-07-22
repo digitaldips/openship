@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Pin-down tests for the single listing-source dispatcher introduced when
-// listRepos/listOrgRepos were collapsed onto githubService.listReposForOwner.
-// They lock the per-source behavior (App installations / user-token / gh-cli)
+// Pin-down tests for the listing-source dispatch, now resolved by
+// createGitHubSource(ctx) → LocalGitHubSource (gh-FIRST → App → user-token).
+// They lock the per-source behavior (gh-cli / App installations / user-token)
 // so a future change to the dispatch can't silently regress one source.
 
 const {
@@ -49,14 +49,26 @@ vi.mock("../../../src/modules/github/github.local-auth", () => ({
   getLocalGhStatus: vi.fn(),
 }));
 
+// env: {} → CLOUD_MODE is falsy, so createGitHubSource takes the LOCAL branch
+// (GhCliSource + LocalGitHubSource) — exactly the merge these tests exercise.
 vi.mock("../../../src/config/env", () => ({
   env: {},
   runtimeTarget: { id: "local" },
 }));
 
-import { listReposForOwner } from "../../../src/modules/github/github.service";
+import { createGitHubSource } from "../../../src/modules/github/sources";
+// Pre-warm the lazily `await import`-ed source modules (+ their heavy
+// github.service dependency) at collection time, so createGitHubSource's
+// internal dynamic imports hit a warm cache. Otherwise the first call's cold
+// transform can exceed the per-test timeout under full-suite contention.
+import "../../../src/modules/github/sources/gh-cli-source";
+import "../../../src/modules/github/sources/local-source";
+import "../../../src/modules/github/sources/app-source";
 
 const ctx = { userId: "user-1", organizationId: "org-1" } as never;
+
+// ctx is bound at construction now; owner is the only method arg.
+const call = async (owner?: string) => (await createGitHubSource(ctx)).listReposForOwner(owner);
 
 function raw(fullName: string) {
   return { full_name: fullName, name: fullName.split("/")[1], owner: { login: fullName.split("/")[0] } };
@@ -80,7 +92,7 @@ describe("listReposForOwner — source dispatch", () => {
       getUserStatus.mockResolvedValue({ connected: true, login: "me" });
       githubFetch.mockResolvedValue([raw("acme/site")]);
 
-      const repos = await listReposForOwner(ctx, "acme");
+      const repos = await call("acme");
 
       expect(repos).toHaveLength(1);
       expect(repos?.[0].full_name).toBe("acme/site");
@@ -94,7 +106,7 @@ describe("listReposForOwner — source dispatch", () => {
       getUserStatus.mockResolvedValue({ connected: true, login: "me" });
       githubFetch.mockResolvedValue([raw("me/dotfiles")]);
 
-      await listReposForOwner(ctx, "me");
+      await call("me");
 
       expect(githubFetch).toHaveBeenCalledWith(
         expect.objectContaining({ url: expect.stringContaining("/user/repos") }),
@@ -113,7 +125,7 @@ describe("listReposForOwner — source dispatch", () => {
       getInstallationToken.mockResolvedValue("ghs_install_token");
       ghFetch.mockResolvedValue({ repositories: [raw("acme/site")] });
 
-      const repos = await listReposForOwner(ctx);
+      const repos = await call();
 
       expect(repos).toHaveLength(1);
       expect(repos?.[0].full_name).toBe("acme/site");
@@ -129,7 +141,8 @@ describe("listReposForOwner — source dispatch", () => {
       getUserStatus.mockResolvedValue({ connected: true, login: "me" });
       getUserInstallations.mockResolvedValue([]);
 
-      expect(await listReposForOwner(ctx)).toBeNull();
+      // No-owner + no-installations is the one case that still yields null.
+      expect(await call()).toBeNull();
     });
   });
 
@@ -140,19 +153,24 @@ describe("listReposForOwner — source dispatch", () => {
       getLocalGhToken.mockResolvedValue("gho_token");
       listLocalGhRepos.mockResolvedValue([raw("acme/site"), raw("other/lib")]);
 
-      const repos = await listReposForOwner(ctx, "acme");
+      const repos = await call("acme");
 
       expect(repos).toHaveLength(1);
       expect(repos?.[0].full_name).toBe("acme/site");
       expect(githubFetch).not.toHaveBeenCalled();
     });
 
-    it("returns null (→ caller 400) when no gh token is available", async () => {
+    it("returns [] when no gh token and the App install yields no token", async () => {
+      // No gh token → the merge falls through to the App source. With an owner
+      // given, it hits listInstallationRepos(owner) directly; no install token
+      // → []. (Owner-scoped calls no longer return null — only the no-owner +
+      // no-installations case does, above.)
       resolveGitHubAuthMode.mockResolvedValue("cloud-app");
       getUserStatus.mockResolvedValue({ connected: false });
       getLocalGhToken.mockResolvedValue(null);
+      getInstallationToken.mockResolvedValue(null);
 
-      expect(await listReposForOwner(ctx, "acme")).toBeNull();
+      expect(await call("acme")).toEqual([]);
     });
   });
 });

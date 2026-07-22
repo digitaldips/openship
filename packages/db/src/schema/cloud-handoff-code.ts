@@ -36,8 +36,16 @@ export const cloudHandoffCode = pgTable(
     /** PKCE S256 challenge (base64url). When set, exchange requires a
      *  matching code_verifier — currently only used by the desktop flow. */
     codeChallenge: text("code_challenge"),
+    /** The CLI-generated `state` this code was minted for (device/poll flow).
+     *  Lets a headless CLI retrieve its code by polling `connect-poll?state=`
+     *  instead of catching a browser redirect to a loopback listener. Null for
+     *  the browser-redirect flows that don't poll. Unguessable (128+ bits). */
+    state: text("state"),
     expiresAt: timestamp("expires_at").notNull(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
-  (t) => [index("cloud_handoff_code_expires_idx").on(t.expiresAt)],
+  (t) => [
+    index("cloud_handoff_code_expires_idx").on(t.expiresAt),
+    index("cloud_handoff_code_state_idx").on(t.state),
+  ],
 );

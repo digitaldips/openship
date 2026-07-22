@@ -5,7 +5,7 @@
  * Reads power the Jobs read-model (recent runs per job, last outcome).
  */
 
-import { desc, eq, lt } from "drizzle-orm";
+import { and, desc, eq, isNull, lt } from "drizzle-orm";
 import { generateId } from "@repo/core";
 import type { Database } from "../client";
 import { jobRun } from "../schema/job-run";
@@ -81,6 +81,25 @@ export function createJobRunRepo(db: Database) {
     /** Delete rows older than the cutoff (future prune job). */
     async pruneOlderThan(cutoff: Date): Promise<void> {
       await db.delete(jobRun).where(lt(jobRun.startedAt, cutoff));
+    },
+
+    /**
+     * Close out "running" rows left dangling by a previous process (crash /
+     * restart mid-run) — they'd otherwise show as perpetually "Running" in the
+     * UI. Marks them failed with an interrupted note. Returns how many were
+     * reconciled. SINGLE-BOX ONLY: safe when nothing was running before this
+     * boot (self-hosted / in-process); a multi-replica deployment must not call
+     * this on one replica's boot (a row may be genuinely running elsewhere).
+     */
+    async failStaleRunning(
+      reason = "Interrupted — the service restarted while this run was in progress",
+    ): Promise<number> {
+      const rows = await db
+        .update(jobRun)
+        .set({ status: "failed", finishedAt: new Date(), error: reason })
+        .where(and(eq(jobRun.status, "running"), isNull(jobRun.finishedAt)))
+        .returning();
+      return rows.length;
     },
   };
 }

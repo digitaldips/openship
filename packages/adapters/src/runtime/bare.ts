@@ -43,11 +43,10 @@ import type {
 import { BuildLogger, detectBuildKillHint, runBuildPipeline, sq, type BuildEnvironment } from "./build-pipeline";
 import { runLocalBuild } from "./local-build";
 import { transferLocalDirectory } from "./transfer";
-import { prepareStackOutput, resolveProjectDir } from "./stack-output";
+import { prepareStackOutput, resolveProjectDir, resolveStaticOutputPath } from "./stack-output";
 import type { ProcessSupervisor } from "./supervisor/types";
 import { detectSupervisor } from "./supervisor/detect";
 import { probeListeningPort } from "./port-conflict";
-import { posix as pathPosix } from "node:path";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -600,28 +599,7 @@ export class BareRuntime implements RuntimeAdapter {
   }
 
   resolveStaticRoot(containerId: string, outputDirectory: string): string {
-    if (!outputDirectory || outputDirectory === ".") {
-      return containerId;
-    }
-
-    // SECURITY: the return value becomes OpenResty's `root <dir>;`. It MUST stay
-    // inside the deployment's own workDir — an absolute path (e.g. "/", "/etc")
-    // or a `../`-traversal would point the document root at the host filesystem,
-    // serving /etc/passwd, other tenants' builds, TLS keys, etc. over the app's
-    // public domain (arbitrary file disclosure). Reject absolute, confine relative.
-    if (outputDirectory.startsWith("/")) {
-      throw new Error(
-        `Invalid outputDirectory "${outputDirectory}": must be relative to the project (absolute paths are not allowed).`,
-      );
-    }
-    const base = containerId.replace(/\/+$/, "");
-    const resolved = pathPosix.normalize(pathPosix.join(base, outputDirectory));
-    if (resolved !== base && !resolved.startsWith(`${base}/`)) {
-      throw new Error(
-        `Invalid outputDirectory "${outputDirectory}": escapes the deployment directory.`,
-      );
-    }
-    return resolved;
+    return resolveStaticOutputPath(containerId, outputDirectory);
   }
 
   async stop(containerId: string): Promise<void> {

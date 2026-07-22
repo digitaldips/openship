@@ -1,4 +1,4 @@
-import { and, eq, lt } from "drizzle-orm";
+import { and, desc, eq, gt, lt } from "drizzle-orm";
 import type { Database } from "../client";
 import { cloudHandoffCode } from "../schema";
 
@@ -15,6 +15,8 @@ export interface CreateHandoffCodeInput {
   userData: HandoffUserData;
   sessionToken: string;
   codeChallenge: string | null;
+  /** CLI-generated poll key for the device/poll flow (null for redirect flows). */
+  state?: string | null;
   /** Absolute expiry time. */
   expiresAt: Date;
 }
@@ -24,6 +26,7 @@ export interface HandoffCodeRow {
   userData: HandoffUserData;
   sessionToken: string;
   codeChallenge: string | null;
+  state: string | null;
   expiresAt: Date;
   createdAt: Date;
 }
@@ -41,9 +44,40 @@ export function createCloudHandoffCodeRepo(db: Database) {
           userData: input.userData,
           sessionToken: input.sessionToken,
           codeChallenge: input.codeChallenge,
+          state: input.state ?? null,
           expiresAt: input.expiresAt,
         })
         .onConflictDoNothing({ target: cloudHandoffCode.code });
+    },
+
+    /** Look up the (newest, unexpired) handoff code minted for a device/poll
+     *  `state` — the headless CLI polls this instead of catching a browser
+     *  redirect. NON-destructive: the returned code is still one-time via
+     *  `consume()` at exchange, so repeated polls are safe/idempotent. */
+    async findByState(state: string): Promise<HandoffCodeRow | null> {
+      const now = new Date();
+      const rows = await db
+        .select()
+        .from(cloudHandoffCode)
+        .where(
+          and(
+            eq(cloudHandoffCode.state, state),
+            gt(cloudHandoffCode.expiresAt, now),
+          ),
+        )
+        .orderBy(desc(cloudHandoffCode.createdAt))
+        .limit(1);
+      const row = rows[0];
+      if (!row) return null;
+      return {
+        code: row.code,
+        userData: row.userData as HandoffUserData,
+        sessionToken: row.sessionToken,
+        codeChallenge: row.codeChallenge,
+        state: row.state,
+        expiresAt: row.expiresAt,
+        createdAt: row.createdAt,
+      };
     },
 
     /** Atomically consume a code: read + delete in one round trip.
@@ -68,6 +102,7 @@ export function createCloudHandoffCodeRepo(db: Database) {
         userData: row.userData as HandoffUserData,
         sessionToken: row.sessionToken,
         codeChallenge: row.codeChallenge,
+        state: row.state,
         expiresAt: row.expiresAt,
         createdAt: row.createdAt,
       };

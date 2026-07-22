@@ -26,7 +26,7 @@ describe("personalAccessTokenGrant repo", () => {
   let repo: Awaited<ReturnType<typeof freshRepo>>;
   beforeEach(async () => {
     repo = await freshRepo();
-  });
+  }, 30_000);
 
   it("createMany + listByToken round-trips grants for a token", async () => {
     await repo.createMany("tok_1", [

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { ensureDashboard } from "../lib/dashboard";
 import { installAndStart, preview } from "../lib/service";
 import { resolvePorts } from "../lib/ports";
+import { prepareFromSource, type FromSourceRun } from "../lib/from-source";
 
 interface UpOpts {
   port?: string;
@@ -26,6 +27,14 @@ interface UpOpts {
   managedEdge?: boolean;
   /** ACME contact email for the managed edge. */
   acmeEmail?: string;
+  /** Preview mode: build + run from source (a branch) instead of a published release. */
+  fromSource?: boolean;
+  /** Git branch/tag/sha to build with --from-source (default: main). */
+  ref?: string;
+  /** Build from an existing local checkout instead of cloning. */
+  source?: string;
+  /** Git remote to clone for --from-source (default: oblien/openship). */
+  repo?: string;
 }
 
 /** Normalize a URL/host to `scheme://host`, or null if unparseable. Shared with
@@ -110,10 +119,41 @@ export const upCommand = new Command("up")
     "Managed edge: install OpenResty + a free Let's Encrypt cert on this box and route --public-url's domain to the dashboard (no reverse proxy needed)",
   )
   .option("--acme-email <email>", "Contact email for Let's Encrypt certificates (managed edge)")
+  .option("--from-source", "Preview: build + run Openship from source (a branch) instead of a published release — runs attached")
+  .option("--ref <branch>", "Git branch/tag/sha to build with --from-source (default: main)")
+  .option("--source <path>", "Build from an existing local Openship checkout instead of cloning")
+  .option("--repo <url>", "Git remote to clone for --from-source (default: oblien/openship)")
   .action(async (opts: UpOpts) => {
+    // From-source is a preview build — always attached (not a boot service).
+    if (opts.fromSource || opts.source) return runFromSource(opts);
     if (opts.foreground) return runForeground(opts);
     await startService(opts);
   });
+
+/**
+ * `openship up --from-source`: build a branch (or a local checkout) from source
+ * and run it attached — the remote sibling of `bun dev`. Reuses runForeground
+ * for ALL env / port / public-url / managed-edge wiring; only the API entry
+ * (bun-run raw TS) and the dashboard dir (local build) differ.
+ */
+async function runFromSource(opts: UpOpts): Promise<void> {
+  console.log(chalk.cyan("\n  Building Openship from source (preview mode)…"));
+  console.log(
+    chalk.dim("  Unverified dev build — for previewing a branch, not production self-hosting.\n"),
+  );
+  let src: FromSourceRun;
+  try {
+    src = await prepareFromSource({ ref: opts.ref, source: opts.source, repo: opts.repo });
+  } catch (e) {
+    console.error(
+      chalk.red(`\n  Build from source failed: ${(e as Error).message}\n`) +
+        chalk.dim("  Small boxes can OOM on the dashboard build — build on a bigger machine and pass --source, or use a published release.\n"),
+    );
+    process.exit(1);
+  }
+  console.log(chalk.green(`\n  Built ${src.ref} (${src.sha}). Starting…\n`));
+  await runForeground(opts, src);
+}
 
 /**
  * Default `openship up`: install + start Openship as a persistent service that
@@ -201,15 +241,29 @@ export async function startService(
   }
 }
 
-/** Run the API + dashboard attached to this terminal (also what the service runs). */
-async function runForeground(opts: UpOpts): Promise<void> {
-    const serverEntry = join(SERVER_DIR, "index.js");
-    if (!existsSync(serverEntry)) {
-      console.error(
-        chalk.red("\n  Bundled server not found in this install.") +
-          chalk.dim("\n  Reinstall with `openship update` (or `npm i -g openship`).\n"),
-      );
-      process.exit(1);
+/** Run the API + dashboard attached to this terminal (also what the service runs).
+ *  `source` (set by --from-source) swaps the API entry to a bun-run of the built
+ *  dist and points the dashboard at the local build; everything else is shared. */
+async function runForeground(opts: UpOpts, source?: FromSourceRun): Promise<void> {
+    // API launch: from-source runs the built dist's raw TS via bun; the normal
+    // path runs the CLI-bundled server with the current runtime (node/bun).
+    let apiCmd = process.execPath;
+    let apiArgs: string[];
+    let apiCwd: string | undefined;
+    if (source) {
+      apiCmd = "bun";
+      apiArgs = ["run", "src/index.ts"];
+      apiCwd = source.apiDir;
+    } else {
+      const serverEntry = join(SERVER_DIR, "index.js");
+      if (!existsSync(serverEntry)) {
+        console.error(
+          chalk.red("\n  Bundled server not found in this install.") +
+            chalk.dim("\n  Reinstall with `openship update` (or `npm i -g openship`).\n"),
+        );
+        process.exit(1);
+      }
+      apiArgs = [serverEntry];
     }
 
     // Same dynamic allocation as the service installer: prefer the flag /
@@ -243,10 +297,14 @@ async function runForeground(opts: UpOpts): Promise<void> {
       OPENSHIP_TARGET: "local",
       OPENSHIP_JOB_RUNNER: "in-process",
       PGLITE_DATA_DIR: dataDir,
-      OPENSHIP_MIGRATIONS_DIR: join(SERVER_DIR, "migrations"),
-      OPENSHIP_PGLITE_ASSETS_DIR: join(SERVER_DIR, "pglite"),
       BETTER_AUTH_SECRET: ensureAuthSecret(),
     };
+    // Bundled server relocates its migrations + pglite assets next to the entry;
+    // from-source resolves them from the dist's workspace layout, so leave unset.
+    if (!source) {
+      env.OPENSHIP_MIGRATIONS_DIR = join(SERVER_DIR, "migrations");
+      env.OPENSHIP_PGLITE_ASSETS_DIR = join(SERVER_DIR, "pglite");
+    }
     // CLI-managed instances ALWAYS require login (zero-auth is desktop-only).
     // The admin is created by `openship` setup via the internal-token-gated
     // bootstrap endpoint; both processes share this token file.
@@ -286,7 +344,8 @@ async function runForeground(opts: UpOpts): Promise<void> {
     // whole subtree (the API/dashboard may fork workers) with one group signal,
     // and so an orphan can be found + swept by `openship stop`. NOT unref'd — the
     // parent still owns their lifecycle.
-    const child = spawn(process.execPath, [serverEntry], {
+    const child = spawn(apiCmd, apiArgs, {
+      cwd: apiCwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
@@ -371,10 +430,13 @@ async function runForeground(opts: UpOpts): Promise<void> {
     // alongside the API. A UI failure is non-fatal — the API keeps serving.
     let dashboardUrl: string | null = null;
     if (opts.ui !== false) {
+      // From-source: use the locally-built standalone (ensureDashboard's
+      // OPENSHIP_DASHBOARD_DIR override) instead of downloading a release asset.
+      if (source) process.env.OPENSHIP_DASHBOARD_DIR = source.dashboardDir;
       const uiSpinner = ora("Preparing the dashboard…").start();
       try {
         const bundle = await ensureDashboard({
-          tag: opts.uiVersion || `v${__CLI_VERSION__}`,
+          tag: source ? "local" : opts.uiVersion || `v${__CLI_VERSION__}`,
           onProgress: (received, total) => {
             if (total) {
               uiSpinner.text = `Downloading dashboard… ${Math.round((received / total) * 100)}%`;

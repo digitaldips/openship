@@ -34,12 +34,20 @@ Add the server (SSH), then **install Openship onto it like any other app** — p
 
 ### B) With the CLI (on the server)
 
+Install the CLI, then just run **`openship`** — an interactive wizard walks you through it: it creates the **first admin**, attaches your domain, and installs Openship as a boot service. Run `openship` again later to manage the running instance.
+
 ```bash
-npm i -g openship            # or: curl -fsSL https://get.openship.io | sh
+curl -fsSL https://get.openship.io | sh      # install  (or: npm i -g openship)
+openship                                     # interactive setup, then control panel
+```
+
+Prefer a one-shot, flag-driven setup for CI / headless boxes? Drive `openship up` directly instead of the wizard:
+
+```bash
 openship up --public-url https://ops.example.com
 ```
 
-- `openship up` installs Openship as a background service (starts on boot, auto-restarts) and runs the setup wizard — it creates the **first admin** and attaches a domain.
+- `openship up` installs the same background service the wizard does (starts on boot, auto-restarts), driven entirely by flags.
 - `--public-url <url>` makes the dashboard reachable at your domain. Login is required; everyone else joins by invite only.
 - `--managed-edge` also installs OpenResty + a free Let's Encrypt cert on the box and routes your domain to the dashboard — no separate reverse proxy needed. Omit it if you run your own proxy in front.
 - One-off attached run instead of a service: `openship up --foreground`.

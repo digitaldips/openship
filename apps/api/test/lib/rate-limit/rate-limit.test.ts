@@ -126,8 +126,8 @@ describe("rateLimit() fail-open on store error", () => {
 
     const res = await rl({ policy: "default-anon", subjectId: "1.2.3.4" });
     expect(res.allowed).toBe(true);
-    // Policy "default-anon" has limit=100.
-    expect(res.remaining).toBe(100);
+    // Policy "default-anon" has limit=300.
+    expect(res.remaining).toBe(300);
     expect(res.resetMs).toBe(60_000);
 
     await shutdown();
@@ -169,7 +169,7 @@ describe("POLICIES catalog", () => {
     const p = getPolicy("default-anon");
     expect(p).toMatchObject({
       id: "default-anon",
-      limit: 100,
+      limit: 300,
       windowMs: 60_000,
       subject: "ip",
     });

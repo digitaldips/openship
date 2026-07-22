@@ -63,45 +63,97 @@ function resolveProxyTarget(
   return { reason: `proxy_pass host "${host}" is an undeclared upstream — not migratable` };
 }
 
+/**
+ * `location <path> { … proxy_pass … }` targets within a server block, in source
+ * order. `proxy_pass` is only valid inside a location (or `if`) in nginx, so
+ * this — not a server-level scan — is where real routes live. Balanced-brace
+ * matched so a nested `if {}` inside a location doesn't truncate it.
+ */
+function extractLocationProxies(serverBody: string): { path: string; proxyPass: string }[] {
+  const out: { path: string; proxyPass: string }[] = [];
+  const re = /(?:^|[\s;}])location\s+([^{]+?)\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(serverBody)) !== null) {
+    const path = m[1].trim();
+    const openIdx = m.index + m[0].length - 1; // the `{`
+    let depth = 1;
+    let i = openIdx + 1;
+    for (; i < serverBody.length && depth > 0; i++) {
+      if (serverBody[i] === "{") depth++;
+      else if (serverBody[i] === "}") depth--;
+    }
+    if (depth !== 0) break; // unbalanced — stop
+    const locBody = serverBody.slice(openIdx + 1, i - 1);
+    re.lastIndex = i;
+    const pp = firstDirective(locBody, "proxy_pass");
+    if (pp) out.push({ path, proxyPass: pp });
+  }
+  return out;
+}
+
 function parseServer(
   body: string,
   source: string,
   upstreams: Map<string, string>,
-): ImportedSite | { warning: string } {
+): { site?: ImportedSite; warnings: string[] } {
+  const warnings: string[] = [];
   const names = firstDirective(body, "server_name")
     ?.split(/\s+/)
     .filter((n) => n && n !== "_" && !n.startsWith("~"))
     ?? [];
 
-  // ssl if any `listen ... ssl` or `listen 443`
+  // ssl if any `listen ... ssl` or `listen 443` (443 as a whole token — not 8443)
   const listens = [...body.matchAll(/(?:^|[;{\s])listen\s+([^;]+);/g)].map((m) => m[1]);
   const ssl = listens.some((l) => /\bssl\b/.test(l) || /\b443\b/.test(l));
 
-  const proxyPass = firstDirective(body, "proxy_pass");
   const root = firstDirective(body, "root");
   const certPath = firstDirective(body, "ssl_certificate");
   const keyPath = firstDirective(body, "ssl_certificate_key");
 
   if (names.length === 0) {
-    return { warning: `nginx: skipped a server block with no usable server_name (${source})` };
+    return { warnings: [`nginx: skipped a server block with no usable server_name (${source})`] };
+  }
+
+  // All routes for this vhost. Locations are the real source; fall back to a
+  // (technically-invalid but seen-in-the-wild) server-level proxy_pass.
+  const rawTargets = extractLocationProxies(body);
+  if (rawTargets.length === 0) {
+    const serverLevel = firstDirective(body, "proxy_pass");
+    if (serverLevel) rawTargets.push({ path: "/", proxyPass: serverLevel });
+  }
+
+  const resolved: { path: string; url: string }[] = [];
+  for (const t of rawTargets) {
+    const r = resolveProxyTarget(t.proxyPass, upstreams);
+    if ("reason" in r) warnings.push(`nginx: ${names[0]} ${t.path} — ${r.reason} (skipped)`);
+    else resolved.push({ path: t.path, url: r.url });
   }
 
   let target: ImportedSite["target"];
-  if (proxyPass) {
-    const resolved = resolveProxyTarget(proxyPass, upstreams);
-    if ("reason" in resolved) {
-      return { warning: `nginx: ${names[0]} — ${resolved.reason} (skipped)` };
+  if (resolved.length > 0) {
+    // Primary = the root location ("/") if present, else the first resolved.
+    const primary = resolved.find((r) => r.path === "/") ?? resolved[0];
+    target = { kind: "proxy", url: primary.url };
+    // An ImportedSite carries ONE upstream, but an OpenResty vhost can't
+    // path-route today — so surface any additional distinct upstreams instead
+    // of silently dropping the extra locations.
+    const others = resolved.filter((r) => r !== primary && r.url !== primary.url);
+    if (others.length > 0) {
+      warnings.push(
+        `nginx: ${names[0]} path-routes to multiple upstreams; migrated ${primary.path} → ${primary.url}. ` +
+          `Re-add manually: ${others.map((o) => `${o.path} → ${o.url}`).join(", ")}`,
+      );
     }
-    target = { kind: "proxy", url: resolved.url };
   } else if (root) {
     target = { kind: "static", root: root.replace(/;$/, "") };
   } else {
-    return { warning: `nginx: ${names[0]} has neither proxy_pass nor root — skipped (${source})` };
+    warnings.push(`nginx: ${names[0]} has neither proxy_pass nor root — skipped (${source})`);
+    return { warnings };
   }
 
   const site: ImportedSite = { serverNames: names, ssl, target, source };
   if (certPath && keyPath) site.tls = { certPath, keyPath };
-  return site;
+  return { site, warnings };
 }
 
 export async function scanNginx(executor: CommandExecutor): Promise<ProxyScanResult> {
@@ -123,9 +175,9 @@ export async function scanNginx(executor: CommandExecutor): Promise<ProxyScanRes
   }
 
   for (const body of blocks) {
-    const parsed = parseServer(body, "nginx", upstreams);
-    if ("warning" in parsed) warnings.push(parsed.warning);
-    else sites.push(parsed);
+    const { site, warnings: blockWarnings } = parseServer(body, "nginx", upstreams);
+    warnings.push(...blockWarnings);
+    if (site) sites.push(site);
   }
 
   return { proxy: "nginx", sites, warnings };

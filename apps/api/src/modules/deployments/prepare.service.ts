@@ -21,15 +21,28 @@ import {
   type ProjectRootSnapshotInput,
   type RepoTreeEntry,
 } from "../../lib/project-root-detector";
-import { parseDeploymentMetadata, type ProjectType, type RoutingConfig } from "@repo/core";
+import {
+  parseDeploymentMetadata,
+  parseOpenshipConfigJson,
+  METADATA_FILES,
+  type ProjectType,
+  type RoutingConfig,
+  type OpenshipConfig,
+  type OpenshipDomain,
+  type OpenshipEnv,
+  type OpenshipService,
+  type OpenshipResources,
+  type OpenshipMonorepoApp,
+} from "@repo/core";
 import { env } from "../../config";
 import { createGitHubReader, type ProjectReader } from "./project-reader";
 
 const PREPARE_FILE_CONTENTS = [
   ...MANIFEST_FILES,
+  // Platform-config files (vercel.json / render.yaml / railway.{toml,json}) come
+  // from the metadata parser registry, so adding a parser reads its file here too.
+  ...METADATA_FILES,
   "pnpm-workspace.yaml",
-  "vercel.json",
-  "render.yaml",
   "turbo.json",
   "nx.json",
   "rush.json",
@@ -79,10 +92,31 @@ export interface ProjectInfo {
   monorepoApps?: MonorepoApp[];
   monorepoWorkspace?: MonorepoWorkspace;
   rootEnv?: Record<string, string>;
-  /** Routing config parsed from the repo-root `vercel.json` (rewrites/redirects/
-   *  headers/cleanUrls/trailingSlash). Persisted on the project + compiled to
-   *  OpenResty at deploy. */
+  /** Routing config parsed from the repo-root `vercel.json`/`openship.json`
+   *  (rewrites/redirects/headers/cleanUrls/trailingSlash). Persisted on the
+   *  project + compiled to OpenResty at deploy. */
   routing?: RoutingConfig;
+  // ── Declared overlay (repo-root `openship.json`) ─────────────────────────
+  // Fields the heuristic detector doesn't produce, declared by the user and
+  // authoritative when present. Build-shaping fields (framework/commands/
+  // output/routing) fold in through the metadata parser and appear above.
+  /** How the app is served: "host"/"static"/"standalone" (seeds hasServer). */
+  productionMode?: "host" | "static" | "standalone";
+  /** Bare-metal vs Docker runtime, declared intent (git apps pick at deploy). */
+  runtimeMode?: "bare" | "docker";
+  /** Declared public endpoints (from `domains`), normalized to the create shape. */
+  publicEndpoints?: DeclaredPublicEndpoint[];
+  /** Declared resource sizing (cloud tier or explicit cpu/mem/disk). */
+  resources?: OpenshipResources;
+}
+
+/** A `domains[]` entry normalized to the `CreateProjectBody.publicEndpoints` shape. */
+export interface DeclaredPublicEndpoint {
+  domain?: string;
+  customDomain?: string;
+  domainType: "free" | "custom";
+  port?: number;
+  targetPath?: string;
 }
 
 /**
@@ -97,6 +131,159 @@ function extractRootRouting(fileContents: Record<string, string>): RoutingConfig
     if (meta.routing) return meta.routing;
   }
   return undefined;
+}
+
+/**
+ * Parse the repo-ROOT `openship.json` (case-insensitive) into a validated config.
+ * The prepare pipeline overlays it leniently: validation `errors` are ignored
+ * here (surfaced by `openship config validate`); only well-formed fields overlay.
+ * Its build-shaping subset flows separately through the metadata parser fold.
+ */
+function extractOpenshipConfig(fileContents: Record<string, string>): OpenshipConfig | undefined {
+  const entry = Object.entries(fileContents).find(([name]) => name.toLowerCase() === "openship.json");
+  if (!entry?.[1]) return undefined;
+  return parseOpenshipConfigJson(entry[1]).config ?? undefined;
+}
+
+/**
+ * Normalize declared `domains[]` to the `CreateProjectBody.publicEndpoints`
+ * shape. A hostname with a dot is a custom domain (goes in `customDomain`); a
+ * bare label is a free subdomain (goes in `domain`). Honors an explicit `type`.
+ */
+function domainsToPublicEndpoints(domains: OpenshipDomain[]): DeclaredPublicEndpoint[] {
+  return domains.map((d) => {
+    const isCustom = d.type ? d.type === "custom" : d.domain.includes(".");
+    return {
+      ...(isCustom ? { customDomain: d.domain } : { domain: d.domain }),
+      domainType: isCustom ? ("custom" as const) : ("free" as const),
+      ...(d.port !== undefined && { port: d.port }),
+      ...(d.targetPath !== undefined && { targetPath: d.targetPath }),
+    };
+  });
+}
+
+/**
+ * Flatten declared env to the plain `Record<string,string>` used both by compose
+ * rows and the project-level `rootEnv` seed. The `secret` flag is dropped here —
+ * the deploy seeds these as editable env rows (the user marks secrets in the UI /
+ * the env-merge endpoint is the encrypt-at-rest path); a declared value is never
+ * an opaque masked secret at this stage.
+ */
+function envMapToRecord(envMap: OpenshipEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(envMap)) out[k] = typeof v === "string" ? v : v.value;
+  return out;
+}
+
+/** Split a declared hostname into the (customDomain|domain, domainType) pair. */
+function splitDomain(host: string): { domain?: string; customDomain?: string; domainType: "free" | "custom" } {
+  return host.includes(".")
+    ? { customDomain: host, domainType: "custom" }
+    : { domain: host, domainType: "free" };
+}
+
+/**
+ * Map declared `services[]` to the compose-service rows the deploy pipeline
+ * persists. A declared service is a full compose definition, so this replaces
+ * detection (the project becomes a `services` project). Healthcheck maps into
+ * the `advanced` JSONB blob, mirroring the compose parser.
+ */
+function openshipServicesToCompose(services: OpenshipService[]): ComposeService[] {
+  return services.map((s) => {
+    const domain = s.domain ? splitDomain(s.domain) : undefined;
+    return {
+      name: s.name,
+      ...(s.image && { image: s.image }),
+      ...(s.build && { build: s.build }),
+      ...(s.dockerfile && { dockerfile: s.dockerfile }),
+      ports: s.ports ?? [],
+      dependsOn: s.dependsOn ?? [],
+      environment: s.env ? envMapToRecord(s.env) : {},
+      volumes: s.volumes ?? [],
+      ...(s.command && { command: s.command }),
+      ...(s.restart && { restart: s.restart }),
+      ...(s.healthcheck && { advanced: { healthcheck: s.healthcheck } }),
+      ...(s.exposed !== undefined && { exposed: s.exposed }),
+      ...(s.exposedPort && { exposedPort: s.exposedPort }),
+      ...(domain ?? {}),
+    };
+  });
+}
+
+/**
+ * Merge declared monorepo app OVERRIDES onto the detector's discovered sub-apps,
+ * matched by normalized `rootDirectory`. Only fields the user set override the
+ * detected value; unmatched declarations are ignored (declaring apps the
+ * detector didn't find is out of scope — use per-sub-app config instead).
+ */
+function mergeMonorepoApps(detected: MonorepoApp[], declared: OpenshipMonorepoApp[]): MonorepoApp[] {
+  const byRoot = new Map(
+    declared.map((d) => [normalizeProjectRootDirectory(d.rootDirectory), d]),
+  );
+  return detected.map((app) => {
+    const d = byRoot.get(normalizeProjectRootDirectory(app.rootDirectory));
+    if (!d) return app;
+    return {
+      ...app,
+      ...(d.framework && { stack: d.framework }),
+      ...(d.packageManager && { packageManager: d.packageManager }),
+      ...(d.installCommand && { installCommand: d.installCommand }),
+      ...(d.buildCommand && { buildCommand: d.buildCommand }),
+      ...(d.startCommand && { startCommand: d.startCommand }),
+      ...(d.outputDirectory && { outputDirectory: d.outputDirectory }),
+      ...(d.buildImage && { buildImage: d.buildImage }),
+      ...(d.port !== undefined && { port: d.port }),
+    };
+  });
+}
+
+/**
+ * Overlay a repo-root `openship.json` onto detected ProjectInfo. Only the fields
+ * the metadata parser can't carry (runtime/port/productionMode/sleepMode/domains/
+ * env) are applied here; each present field wins over detection, absent fields
+ * keep the detected value. Mutates + returns `info` for call-site brevity.
+ */
+function applyOpenshipOverlay(info: ProjectInfo, config: OpenshipConfig | undefined): ProjectInfo {
+  if (!config) return info;
+  if (config.packageManager) info.packageManager = config.packageManager;
+  if (config.rootDirectory) info.rootDirectory = config.rootDirectory;
+  if (config.buildImage) info.buildImage = config.buildImage;
+  if (config.productionPaths) info.productionPaths = config.productionPaths;
+  if (config.port !== undefined) info.port = config.port;
+  if (config.productionMode) info.productionMode = config.productionMode;
+  if (config.runtime) info.runtimeMode = config.runtime;
+  if (config.domains?.length) info.publicEndpoints = domainsToPublicEndpoints(config.domains);
+  if (config.env && Object.keys(config.env).length > 0) {
+    // Merge onto detected `.env` seed (declared wins per key) so declared env
+    // flows through the existing rootEnv → wizard env-row seam.
+    info.rootEnv = { ...(info.rootEnv ?? {}), ...envMapToRecord(config.env) };
+  }
+  if (config.resources) info.resources = config.resources;
+
+  // Declared compose services replace detection: the project IS a services
+  // project. runtimeMode="docker" then falls out of buildProductionProjectInput's
+  // projectType pin, so no explicit runtime is needed here.
+  if (config.services?.length) {
+    info.services = openshipServicesToCompose(config.services);
+    info.projectType = "services";
+  }
+
+  // Monorepo: overlay workspace + merge per-app build overrides onto the
+  // detector's discovered sub-apps. Only meaningful once detection produced
+  // sub-apps (declaring apps from scratch is out of scope — see mergeMonorepoApps).
+  if (config.monorepo) {
+    if (config.monorepo.workspace && info.monorepoWorkspace) {
+      info.monorepoWorkspace = {
+        packageManager: config.monorepo.workspace.packageManager,
+        prepareCommand:
+          config.monorepo.workspace.prepareCommand ?? info.monorepoWorkspace.prepareCommand,
+      };
+    }
+    if (config.monorepo.apps?.length && info.monorepoApps?.length) {
+      info.monorepoApps = mergeMonorepoApps(info.monorepoApps, config.monorepo.apps);
+    }
+  }
+  return info;
 }
 
 /**
@@ -121,6 +308,16 @@ export function projectInfoToScanResponse(result: ProjectInfo) {
     productionPaths: result.productionPaths,
     port: result.port,
     services: result.services,
+    // Declared-overlay fields (openship.json) — omitted from the response when
+    // absent so a repo without the file yields the exact same payload as before.
+    ...(result.productionMode && { productionMode: result.productionMode }),
+    ...(result.runtimeMode && { runtimeMode: result.runtimeMode }),
+    ...(result.publicEndpoints && { publicEndpoints: result.publicEndpoints }),
+    ...(result.resources && { resources: result.resources }),
+    ...(result.rootEnv && Object.keys(result.rootEnv).length > 0 && { rootEnv: result.rootEnv }),
+    ...(result.routing && { routing: result.routing }),
+    ...(result.monorepoWorkspace && { monorepoWorkspace: result.monorepoWorkspace }),
+    ...(result.monorepoApps && { monorepoApps: result.monorepoApps }),
   };
 }
 
@@ -286,8 +483,10 @@ export async function resolveFromReader(
     readProjectText(reader, selected.rootDirectory, ".env"),
   ]);
   const routing = extractRootRouting(rootSnapshot.fileContents ?? {});
+  const openshipConfig = extractOpenshipConfig(rootSnapshot.fileContents ?? {});
 
-  return toProjectInfo(repoMeta, selected, composeContent, selectedBranch, composeEnvContent, monorepo, routing);
+  const info = toProjectInfo(repoMeta, selected, composeContent, selectedBranch, composeEnvContent, monorepo, routing);
+  return applyOpenshipOverlay(info, openshipConfig);
 }
 
 async function resolveFromGitHub(

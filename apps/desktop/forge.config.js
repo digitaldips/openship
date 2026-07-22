@@ -60,6 +60,9 @@ module.exports = {
       path.join(RESOURCES, "dashboard"),
       path.join(RESOURCES, "migrations"),
       path.join(RESOURCES, "pglite"),
+      // ssh2 + dockerode (externalized from the --compile binary) — resolved at
+      // runtime via NODE_PATH=<Resources>/node_modules in services.ts.
+      path.join(RESOURCES, "node_modules"),
     ],
     ...osxSigning,
   },

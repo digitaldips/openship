@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
-import { NginxProvider } from "./nginx";
+import { NginxProvider, renderProxyOptions } from "./nginx";
+import { PROXY_GZIP_TYPES } from "@repo/core";
 import { OPENRESTY_DEFAULT_PATHS, luaSourceAvailable, RULES_GUARD_PATH } from "./openresty-lua";
 import type { CommandExecutor, RouteConfig } from "../types";
 
@@ -134,5 +135,64 @@ describe("NginxProvider config generation", () => {
     await expect(nginx.registerRoute(PROXY)).rejects.toThrow();
     // Rolled back — the bad block did not persist.
     expect(conf("app-example-com")).toBe("# PRIOR GOOD CONFIG");
+  });
+});
+
+describe("renderProxyOptions (curated reverse-proxy directives)", () => {
+  test("empty / undefined → no directives", () => {
+    expect(renderProxyOptions(undefined)).toBe("");
+    expect(renderProxyOptions({})).toBe("");
+  });
+
+  test("renders each valid directive", () => {
+    const out = renderProxyOptions({
+      clientMaxBodySize: "25m",
+      proxyReadTimeout: "60s",
+      proxySendTimeout: "60s",
+      clientBodyTimeout: "30s",
+      proxyBuffering: false,
+    });
+    expect(out).toContain("client_max_body_size 25m;");
+    expect(out).toContain("proxy_read_timeout 60s;");
+    expect(out).toContain("proxy_send_timeout 60s;");
+    expect(out).toContain("client_body_timeout 30s;");
+    expect(out).toContain("proxy_buffering off;");
+  });
+
+  test("gzip on → emits the FIXED type set (never user input)", () => {
+    const out = renderProxyOptions({ gzip: true });
+    expect(out).toContain("gzip on;");
+    expect(out).toContain(`gzip_types ${PROXY_GZIP_TYPES};`);
+    expect(out).toContain("gzip_min_length 1024;");
+    expect(renderProxyOptions({ gzip: false })).toContain("gzip off;");
+    expect(renderProxyOptions({ gzip: false })).not.toContain("gzip_types");
+  });
+
+  test("DROPS malformed values (injection / bad-value guard)", () => {
+    const out = renderProxyOptions({
+      // all invalid: injection attempt, wrong unit, non-positive, junk
+      clientMaxBodySize: "25m; add_header X-Evil 1",
+      proxyReadTimeout: "60x",
+      proxySendTimeout: "0s",
+    } as never);
+    expect(out).toBe("");
+    expect(out).not.toContain("add_header");
+  });
+});
+
+describe("registerRoute renders proxy directives at server scope", () => {
+  test("route.proxy → directive present in the generated vhost", async () => {
+    const { nginx, conf } = setup({ certDomains: ["app.example.com"] });
+    await nginx.registerRoute({ ...PROXY, proxy: { clientMaxBodySize: "50m" } });
+    const c = conf("app-example-com")!;
+    expect(c).toContain("client_max_body_size 50m;");
+    // server scope, not inside a location block
+    expect(c).toContain("listen 443 ssl;");
+  });
+
+  test("no route.proxy → no body-size directive (inherits server default)", async () => {
+    const { nginx, conf } = setup({ certDomains: ["app.example.com"] });
+    await nginx.registerRoute(PROXY);
+    expect(conf("app-example-com")!).not.toContain("client_max_body_size");
   });
 });

@@ -3,8 +3,8 @@
  * control plane on the user's Node — no monorepo, no bun, no external Postgres.
  *
  * Produces apps/cli/dist/server/:
- *   index.js       the API as one node-runnable bundle (@repo/* + deps inlined;
- *                  cpu-features left external — ssh2 guards it and falls back)
+ *   index.js       the API as one node-runnable bundle (@repo/* + deps inlined,
+ *                  EXCEPT the SSH/Docker native stack — see `external` below)
  *   pglite/        pglite.wasm + pglite.data → OPENSHIP_PGLITE_ASSETS_DIR
  *   migrations/    drizzle .sql → OPENSHIP_MIGRATIONS_DIR
  *   lua/           OpenResty scripts read by openresty-lua.ts relative to its own bundled path
@@ -31,7 +31,13 @@ const result = await Bun.build({
   target: "node",
   outdir: OUT,
   naming: "index.js",
-  external: ["cpu-features"],
+  // ssh2 + dockerode MUST stay external and load from the installed package's
+  // node_modules (they're runtime `dependencies` of the CLI). Bundling them
+  // mangles ssh2's dynamic cipher/KEX `require()`s and dockerode's transport,
+  // so a bundled build hangs at the SSH handshake / Docker socket-forward
+  // (works under `bun dev` only because that loads them unbundled). cpu-features
+  // is ssh2's optional native dep — external + optional, ssh2 falls back.
+  external: ["cpu-features", "ssh2", "dockerode"],
 });
 if (!result.success) {
   console.error("[stage-server] API bundle failed:");

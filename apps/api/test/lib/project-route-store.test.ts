@@ -9,11 +9,24 @@ const domainRepo = vi.hoisted(() => ({
   findByHostname: vi.fn(),
 }));
 
+const projectRepo = vi.hoisted(() => ({
+  findById: vi.fn(),
+}));
+
 vi.mock("@repo/db", () => ({
   repos: {
     domain: domainRepo,
+    project: projectRepo,
   },
 }));
+
+// checkManagedSlugAvailable calls platform().runtime and only does anything for
+// a CloudRuntime; a plain object is not one, so it returns null (local-DB path)
+// instead of getPlatform() throwing "Platform not initialized" under vitest.
+vi.mock("../../src/lib/controller-helpers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/lib/controller-helpers")>();
+  return { ...actual, platform: () => ({ runtime: {} }) };
+});
 
 import { getRoutingBaseDomain } from "../../src/lib/routing-domains";
 import { syncProjectPublicRoutes } from "../../src/lib/project-route-store";
@@ -25,6 +38,7 @@ describe("syncProjectPublicRoutes", () => {
     domainRepo.remove.mockReset();
     domainRepo.listByProject.mockReset();
     domainRepo.findByHostname.mockReset();
+    projectRepo.findById.mockReset();
     domainRepo.create.mockImplementation(async (data: any) => ({
       id: "dom_created",
       ...data,
@@ -96,6 +110,9 @@ describe("syncProjectPublicRoutes", () => {
 
   it("throws a conflict when the hostname already belongs to another project", async () => {
     const hostname = `business-servio.${getRoutingBaseDomain()}`;
+    // The conflicting row's owner project still exists → a real conflict
+    // (resolveLocalConflict returns the row instead of treating it as an orphan).
+    projectRepo.findById.mockResolvedValue({ id: "proj_other" });
     domainRepo.findByHostname.mockResolvedValue({
       id: "dom_other",
       projectId: "proj_other",

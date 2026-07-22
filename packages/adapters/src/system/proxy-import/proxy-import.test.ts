@@ -67,6 +67,73 @@ describe("scanNginx", () => {
     expect(res.warnings.some((w) => w.includes("ghost"))).toBe(true);
     expect(res.warnings.some((w) => w.includes("variable"))).toBe(true);
   });
+
+  test("path-routing: migrates the root location, warns about extra upstreams (no silent collapse)", async () => {
+    // `location /` is declared AFTER `/api` — the primary must still be `/`.
+    const conf = `
+      server {
+        server_name app.example.com;
+        listen 443 ssl;
+        location /api { proxy_pass http://127.0.0.1:9000; }
+        location /    { proxy_pass http://127.0.0.1:3000; }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+    expect(res.sites).toHaveLength(1);
+    // primary = the root location, not the first-appearing one
+    expect(res.sites[0].target).toEqual({ kind: "proxy", url: "http://127.0.0.1:3000" });
+    // the /api upstream is NOT dropped silently — it's surfaced as a warning
+    const w = res.warnings.find((x) => x.includes("path-routes"));
+    expect(w).toBeTruthy();
+    expect(w).toContain("/api");
+    expect(w).toContain("http://127.0.0.1:9000");
+  });
+
+  test("nested if/location braces don't truncate the block", async () => {
+    const conf = `
+      server {
+        server_name nested.example.com;
+        location / {
+          if ($request_method = POST) { return 405; }
+          proxy_pass http://127.0.0.1:7000;
+        }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+    const site = res.sites.find((s) => s.serverNames.includes("nested.example.com"));
+    expect(site?.target).toEqual({ kind: "proxy", url: "http://127.0.0.1:7000" });
+  });
+
+  test("redirect-only server (no proxy_pass / root) is skipped with a warning", async () => {
+    const conf = `
+      server {
+        server_name redir.example.com;
+        location / { return 301 https://elsewhere.example.com$request_uri; }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+    expect(res.sites.some((s) => s.serverNames.includes("redir.example.com"))).toBe(false);
+    expect(res.warnings.some((w) => w.includes("redir.example.com"))).toBe(true);
+  });
+
+  test("ssl detection: IPv6 :443 counts, 8443 does not false-positive", async () => {
+    const conf = `
+      server {
+        listen 80;
+        listen [::]:443 ssl;
+        server_name six.example.com;
+        location / { proxy_pass http://127.0.0.1:4000; }
+      }
+      server {
+        listen 8443;
+        server_name eight.example.com;
+        location / { proxy_pass http://127.0.0.1:5000; }
+      }
+    `;
+    const res = await scanNginx(makeExecutor([["nginx -T", conf]]));
+    expect(res.sites.find((s) => s.serverNames.includes("six.example.com"))?.ssl).toBe(true);
+    expect(res.sites.find((s) => s.serverNames.includes("eight.example.com"))?.ssl).toBe(false);
+  });
 });
 
 describe("scanCaddy", () => {

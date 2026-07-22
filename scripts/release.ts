@@ -36,6 +36,9 @@ import { fileURLToPath } from "node:url";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ROOT_PKG = join(ROOT, "package.json");
 const API_PKG = join(ROOT, "apps/api/package.json");
+// The upgrade-prompt gate. A release ships SILENTLY unless `publish` writes an
+// advisory here for the new version (see release-advisories.json's $comment).
+const ADVISORIES = join(ROOT, "release-advisories.json");
 // Every package.json whose version should track the release. API is the
 // operative source the next version is computed from; the rest are synced to
 // match so the desktop app (forge reads apps/desktop/package.json), web,
@@ -54,8 +57,22 @@ const SYNCED_PKGS = [
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const forceBranch = args.includes("--force-branch");
-if (args.includes("--help") || args.includes("-h")) usageAndExit();
-const cmd = args.find((a) => !a.startsWith("--"));
+if (args.includes("--help") || args.includes("-h")) usageAndExit(0);
+
+// `publish` is the announcement switch. Without it a release ships SILENTLY —
+// no in-app banner (users still see "vX available" in Settings → Updates and the
+// home Updates block). WITH it, we write a release advisory for this version
+// into release-advisories.json (committed + pinned to the tag), which is the
+// ONLY thing that raises the update banner for users below this version.
+//   bun run release patch            → silent
+//   bun run release patch publish    → announced (recommended)
+//   bun run release patch publish --critical            → critical (always shown)
+//   bun run release patch publish --message="…"         → custom banner body
+const publish = args.includes("publish");
+const critical = args.includes("--critical");
+const message = args.find((a) => a.startsWith("--message="))?.slice("--message=".length);
+// The bump is the first positional that ISN'T the `publish` switch.
+const cmd = args.find((a) => !a.startsWith("--") && a !== "publish");
 
 type BumpKind = "patch" | "minor" | "major" | "rc" | "current" | "literal";
 // No arg (or "current") → release the version already in package.json as-is,
@@ -92,10 +109,21 @@ if (currentApi !== currentRoot) {
 const next = computeNext(currentApi, bump);
 const tag = `v${next}`;
 
+if (publish && tag.includes("-")) {
+  console.error(
+    `Refusing: "publish" announces a STABLE release, but ${tag} is a prerelease ` +
+      `(rc/beta). Clients only pull advisories from the latest STABLE release, so a ` +
+      `prerelease announcement is never seen. Drop "publish" for the rc, or promote to ` +
+      `stable and publish that.`,
+  );
+  process.exit(1);
+}
+
 log(`Current version (apps/api): ${currentApi}`);
 log(`Next version:               ${next}`);
 log(`Tag:                        ${tag}`);
 log(`Prerelease:                 ${tag.includes("-") ? "yes" : "no"}`);
+log(`Announcement:               ${publish ? `yes (${critical ? "critical" : "recommended"} advisory)` : "no — silent release"}`);
 log(``);
 
 if (dryRun) {
@@ -105,6 +133,10 @@ if (dryRun) {
     log(`[dry-run] would update:`);
     for (const p of SYNCED_PKGS) log(`  - ${p}`);
     log(`[dry-run] would commit + push, then tag + push ${tag}`);
+  }
+  if (publish) {
+    log(`[dry-run] would write an announcement advisory to release-advisories.json:`);
+    log(JSON.stringify(buildAdvisory(next, { critical, message }), null, 2));
   }
   log(`[dry-run] no files written, no git ops executed.`);
   process.exit(0);
@@ -122,31 +154,48 @@ if (tagExists(tag)) {
 
 /* ─── Apply ─────────────────────────────────────────────────────────── */
 
-if (bump.kind === "current") {
-  // No version change — release exactly what's committed.
-  git("push", "origin", `refs/heads/${currentBranch()}`);
-  log(`✓ pushed ${currentBranch()} (releasing current version, no bump)`);
-} else {
+// Files to stage into the (single) release commit. Version bumps + the
+// announcement advisory both ride the SAME commit so the advisory is pinned to
+// the tag clients pull.
+const staged: string[] = [];
+
+if (bump.kind !== "current") {
   for (const p of SYNCED_PKGS) writeVersion(p, next);
   log(`✓ updated ${SYNCED_PKGS.length} package.json files`);
+  staged.push(...SYNCED_PKGS);
+}
 
-  git("add", ...SYNCED_PKGS);
-  // Only commit if the version actually changed. Re-releasing the version you're
-  // already on (e.g. after a failed tag push) writes no diff, and `git commit`
-  // would abort with "nothing to commit" and kill the release. Skip the commit
-  // in that case and ship the already-committed version as-is.
+if (publish) {
+  const { entry, replaced } = writeAdvisory(next, { critical, message });
+  log(`✓ wrote announcement advisory "${entry.id}" (${entry.severity})`);
+  if (replaced.length) {
+    log(`  replaced previous advisory(ies): ${replaced.join(", ")}`);
+  }
+  staged.push(ADVISORIES);
+}
+
+if (staged.length > 0) {
+  git("add", ...staged);
+  // Only commit if something actually changed. Re-releasing the version you're
+  // already on (no bump, no publish diff) writes no diff, and `git commit` would
+  // abort with "nothing to commit" and kill the release — ship as-is instead.
   const nothingStaged =
     spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: ROOT }).status === 0;
   if (nothingStaged) {
-    log(`Version already ${next} — no bump commit needed, releasing as-is.`);
+    log(`No changes to commit — releasing as-is.`);
   } else {
-    git("commit", "-m", `Bump to ${tag}`);
+    const msg = publish
+      ? bump.kind === "current"
+        ? `Announce ${tag}`
+        : `Bump to ${tag} + announce`
+      : `Bump to ${tag}`;
+    git("commit", "-m", msg);
     log(`✓ committed`);
   }
-
-  git("push", "origin", `refs/heads/${currentBranch()}`);
-  log(`✓ pushed ${currentBranch()}`);
 }
+
+git("push", "origin", `refs/heads/${currentBranch()}`);
+log(`✓ pushed ${currentBranch()}${bump.kind === "current" && !publish ? " (releasing current version, no bump)" : ""}`);
 
 git("tag", tag);
 // Fully-qualified refspec: a BRANCH sharing the tag's name (e.g. a leftover
@@ -173,10 +222,11 @@ watchCi(tag, actionsUrl);
 
 /* ─── Helpers ──────────────────────────────────────────────────────── */
 
-function usageAndExit(): never {
-  console.error(
+function usageAndExit(code = 1): never {
+  const out = code === 0 ? console.log : console.error;
+  out(
     [
-      "Usage: bun scripts/release.ts [current|patch|minor|major|rc|x.y.z[-rc.N]] [--dry-run] [--force-branch]",
+      "Usage: bun run release [current|patch|minor|major|rc|x.y.z[-rc.N]] [publish [--critical] [--message=…]] [--dry-run] [--force-branch]",
       "",
       "  (no arg)       release the current version as-is (no bump)",
       "  current        same as no arg",
@@ -188,15 +238,28 @@ function usageAndExit(): never {
       "                 0.1.1-rc.2 → 0.1.1   (rc → stable promotion)",
       "  <literal>      explicit semver string",
       "",
-      "  --dry-run      print the plan, don't touch anything",
+      "  publish        ANNOUNCE this release: write a release advisory so the in-app",
+      "                 update banner prompts users below this version. WITHOUT it the",
+      "                 release ships SILENTLY (still shown quietly in Settings → Updates",
+      "                 and the home Updates block). Refused for prereleases.",
+      "    --critical   make the announcement critical (always shown, even if muted)",
+      "    --message=…  custom banner body (default points at the release notes)",
+      "",
+      "  e.g.  bun run release patch                    # silent patch",
+      "        bun run release minor publish            # announced (recommended)",
+      "        bun run release patch publish --critical # announced (critical)",
+      "",
+      "  --dry-run      print the plan, don't touch anything (with `publish`, also",
+      "                 prints the exact advisory JSON that would be written)",
       "  --force-branch run from a non-main branch (default refuses)",
+      "  --help, -h     show this help",
       "",
       "In every case CI builds installers for macOS (arm64 + x64), Windows,",
       "and Linux and publishes them to the GitHub release. Live build status",
       "streams here after the tag is pushed (needs the `gh` CLI, logged in).",
     ].join("\n"),
   );
-  process.exit(1);
+  process.exit(code);
 }
 
 /** True if the tag already exists locally or on origin. */
@@ -408,4 +471,49 @@ function git(...args: (string | { capture: true })[]): string {
 
 function log(msg: string): void {
   console.log(msg);
+}
+
+interface AdvisoryEntry {
+  id: string;
+  severity: "critical" | "recommended";
+  affects: string;
+  title: string;
+  message: string;
+  action: { label: string; kind: "update" };
+}
+
+/** The advisory entry for a published release. `affects: "<version"` means
+ *  everyone BELOW this version sees the banner; users on it (or newer) don't. */
+function buildAdvisory(
+  version: string,
+  opts: { critical?: boolean; message?: string },
+): AdvisoryEntry {
+  return {
+    id: `update-${version}`,
+    severity: opts.critical ? "critical" : "recommended",
+    affects: `<${version}`,
+    title: `Update to Openship ${version}`,
+    message:
+      opts.message ??
+      `Openship ${version} is available. See the release notes for what's new — updating is recommended.`,
+    action: { label: "Update now", kind: "update" },
+  };
+}
+
+/** Write the single announcement advisory into release-advisories.json,
+ *  preserving the file's $comment gate. One active announcement at a time (the
+ *  newest published version); returns any prior advisory ids it replaced. */
+function writeAdvisory(
+  version: string,
+  opts: { critical?: boolean; message?: string },
+): { entry: AdvisoryEntry; replaced: string[] } {
+  const raw = JSON.parse(readFileSync(ADVISORIES, "utf8")) as {
+    $comment?: string;
+    advisories?: Array<{ id?: string }>;
+  };
+  const replaced = (raw.advisories ?? []).map((a) => a.id ?? "").filter(Boolean);
+  const entry = buildAdvisory(version, opts);
+  const nextDoc = { ...raw, advisories: [entry] };
+  writeFileSync(ADVISORIES, JSON.stringify(nextDoc, null, 2) + "\n");
+  return { entry, replaced };
 }

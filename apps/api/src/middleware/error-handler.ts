@@ -8,7 +8,8 @@ import { AppError } from "@repo/core";
  * Order of precedence:
  * 1. ZodError → 400 with field-level details
  * 2. AppError subclass → statusCode + message + code
- * 3. Unknown → 500
+ * 3. SyntaxError → 400 (malformed JSON request body)
+ * 4. Unknown → 500
  *
  * Registered via `app.onError(handleApiError)`. Hono's compose() wraps
  * each dispatch level in try/catch and routes thrown errors to
@@ -35,6 +36,14 @@ export function handleApiError(err: unknown, c: Context) {
       { error: message, code },
       statusCode as 400 | 401 | 403 | 404 | 409 | 500,
     );
+  }
+
+  // `c.req.json()` / `JSON.parse` throw a native SyntaxError on a malformed
+  // request body. Routes without a `tbValidator("json", …)` (most mutation
+  // routes) would otherwise fall through to the 500 branch below, mislabeling
+  // a client input error as a server fault. Map it to 400 centrally.
+  if (err instanceof SyntaxError) {
+    return c.json({ error: "Invalid JSON body", code: "INVALID_JSON" }, 400);
   }
 
   console.error("[UNHANDLED ERROR]", err);

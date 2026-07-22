@@ -21,6 +21,12 @@ import { getJobRunner } from "./job-runner";
 /** A tick's outcome — a small JSON-able summary, or nothing. */
 export type JobSummary = Record<string, unknown> | void;
 
+/** Generous default cap on a single tick's body, so a hung system task fails
+ *  its run (and unblocks the in-process scheduler) instead of hanging forever.
+ *  Override per job via `recordJobRun(..., { timeoutMs })` for genuinely long
+ *  sweeps. */
+const DEFAULT_JOB_TIMEOUT_MS = 10 * 60 * 1000;
+
 /**
  * Run a job body once, wrapping it in a `job_run` history row: opens a
  * "running" row, then closes it "success" (+ summary + duration) or "failed"
@@ -29,17 +35,33 @@ export type JobSummary = Record<string, unknown> | void;
  */
 export async function recordJobRun(
   jobId: string,
-  opts: { trigger?: "schedule" | "manual"; kind?: string },
+  opts: { trigger?: "schedule" | "manual"; kind?: string; timeoutMs?: number },
   fn: () => Promise<JobSummary>,
 ): Promise<JobSummary> {
   const startedMs = Date.now();
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
   const run = await repos.jobRun.start({
     jobId,
     kind: opts.kind,
     trigger: opts.trigger ?? "schedule",
   });
+  // Time-box the body. A handler that never resolves would otherwise leave the
+  // row stuck "running" forever AND (in-process) freeze the whole scheduler,
+  // since armNextTick only re-arms after onTick settles. We can't cancel `fn`
+  // (it keeps running orphaned — a hung system task is a bug), but racing a
+  // timeout guarantees the row is finalized and the tick completes. The default
+  // is generous so legitimate long runs aren't affected.
+  let timer: NodeJS.Timeout | undefined;
   try {
-    const summary = await fn();
+    const summary = await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Job timed out after ${Math.round(timeoutMs / 1000)}s`)),
+          timeoutMs,
+        );
+      }),
+    ]);
     await repos.jobRun.finish(run.id, {
       status: "success",
       durationMs: Date.now() - startedMs,
@@ -53,6 +75,8 @@ export async function recordJobRun(
       error: safeErrorMessage(err),
     });
     throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

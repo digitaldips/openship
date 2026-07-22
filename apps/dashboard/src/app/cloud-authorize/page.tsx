@@ -28,7 +28,7 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Loader2, ServerIcon, AlertCircle } from "lucide-react";
+import { Loader2, ServerIcon, AlertCircle, CheckCircle2 } from "lucide-react";
 import { useSession } from "@/lib/auth-client";
 import { cloudApi } from "@/lib/api";
 import { ApiError, getApiErrorMessage } from "@/lib/api/client";
@@ -111,8 +111,13 @@ function CloudAuthorizeInner() {
   const m = t.misc.cloudAuthorize;
 
   const validated = useMemo(() => validateParams(new URLSearchParams(searchParams.toString()), m), [searchParams, m]);
+  // Device/poll flow (headless CLI over SSH): the CLI can't receive a browser
+  // redirect back to its box, so it polls the SaaS for the code instead. We
+  // just confirm in-place — there's nothing to navigate to.
+  const isDevice = searchParams.get("mode") === "device";
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [deviceDone, setDeviceDone] = useState(false);
 
   const handleAuthorize = useCallback(async () => {
     if (!validated.ok) return;
@@ -124,6 +129,14 @@ function CloudAuthorizeInner() {
         state: validated.state,
         codeChallenge: validated.codeChallenge,
       });
+      if (isDevice) {
+        // The code is now stored keyed by `state`; the CLI's poll will pick it
+        // up. Show a clean confirmation instead of navigating to a URL the
+        // remote box can't be reached at anyway.
+        setDeviceDone(true);
+        setSubmitting(false);
+        return;
+      }
       // Hard navigate so the local instance receives the code via a
       // top-level GET — the local callback (cloud-connect-callback /
       // /api/auth/cloud-callback) needs to read the same-origin
@@ -185,6 +198,20 @@ function CloudAuthorizeInner() {
       <AuthShell>
         <div className="flex items-center justify-center py-8">
           <Loader2 className="size-6 animate-spin text-muted-foreground" />
+        </div>
+      </AuthShell>
+    );
+  }
+
+  if (deviceDone) {
+    return (
+      <AuthShell>
+        <div className="flex flex-col items-center justify-center py-4 text-center">
+          <div className="mb-4 flex size-14 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500/80 to-emerald-600 shadow-sm">
+            <CheckCircle2 className="size-7 text-white" />
+          </div>
+          <h1 className="text-lg font-semibold">{m.deviceDoneTitle}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{m.deviceDoneBody}</p>
         </div>
       </AuthShell>
     );

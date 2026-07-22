@@ -4,6 +4,7 @@
     "deploy-from-github",
     "deploy-local-folder",
     "deploy-template-or-url",
+    "openship-json",
     "custom-domains",
     "environment-variables",
     "compose-multi-service",

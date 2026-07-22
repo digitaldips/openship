@@ -12,8 +12,12 @@
  * the detector doesn't change.
  */
 
+import type { ProxySettings } from "../proxy-settings";
+
 export type DeploymentMetadataSource =
+  | "openship"
   | "vercel"
+  | "railway"
   | "render"
   | "netlify"
   | "heroku"
@@ -55,6 +59,10 @@ export interface RoutingConfig {
   cleanUrls?: boolean;
   /** Enforce (true) or remove (false) trailing slashes. */
   trailingSlash?: boolean;
+  /** Project-level reverse-proxy tunables (client_max_body_size, timeouts,
+   *  buffering, gzip) rendered into every vhost this project owns. Overrides
+   *  the server default; overridden per-service. */
+  proxy?: ProxySettings;
 }
 
 /**

@@ -1,4 +1,6 @@
+import { openshipMetadataParser } from "./openship";
 import { vercelMetadataParser } from "./vercel";
+import { railwayMetadataParser } from "./railway";
 import { renderMetadataParser } from "./render";
 import type { DeploymentMetadata, MetadataParser } from "./types";
 
@@ -11,7 +13,9 @@ export type {
   RoutingConfig,
   MetadataParser,
 } from "./types";
+export { openshipMetadataParser } from "./openship";
 export { vercelMetadataParser, parseVercelConfig, extractCdTargets, type VercelConfig } from "./vercel";
+export { railwayMetadataParser } from "./railway";
 export { renderMetadataParser } from "./render";
 
 /**
@@ -34,11 +38,15 @@ export function missingOutputDirectoryMessage(outputDirectory?: string, subject?
 
 /**
  * All registered metadata parsers, in PRECEDENCE order (highest first).
- * `vercel.json` is authoritative build config; `render.yaml` is a fill-only
- * fallback. Add a source by implementing `MetadataParser` and appending it here.
+ * `openship.json` is the NATIVE format and an explicit declaration, so it wins
+ * over the imported PaaS formats. `vercel.json` and `railway.toml`/`railway.json`
+ * are authoritative build config; `render.yaml` is a fill-only fallback. Add a
+ * source by implementing `MetadataParser` and appending it here.
  */
 export const METADATA_PARSERS: readonly MetadataParser[] = [
+  openshipMetadataParser,
   vercelMetadataParser,
+  railwayMetadataParser,
   renderMetadataParser,
 ];
 

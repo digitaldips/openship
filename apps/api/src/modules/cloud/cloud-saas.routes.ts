@@ -24,6 +24,11 @@ r.public("post", "/connect-authorize", { reason: "Connect authorize - cookie ses
 r.use("/exchange-code", rateLimiter);
 r.public("post", "/exchange-code", { reason: "OAuth code exchange - validated by single-use code, not session" }, saas.exchangeCode);
 
+// Device/poll flow: a headless CLI (over SSH) polls here with its unguessable
+// `state` to pick up its one-time PKCE code — no browser redirect to the box.
+r.use("/connect-poll", rateLimiter);
+r.public("get", "/connect-poll", { reason: "Device-flow poll - CLI retrieves its one-time PKCE code by unguessable state; no session" }, saas.connectPoll);
+
 r.use("/token", cloudSessionAuth);
 r.post("/token", { tag: "cloud:write" }, saas.getToken);
 

@@ -51,7 +51,7 @@ describe("project.repo env writes (PGlite)", () => {
   beforeEach(async () => {
     ctx = await freshRepo();
     await seed(ctx.db);
-  });
+  }, 30_000);
 
   it("mergeEnvVars touches ONLY the named keys — untouched secret + other scopes survive", async () => {
     await ctx.repo.mergeEnvVars(

@@ -23,16 +23,19 @@ import { Modal } from "@/components/ui/Modal";
 import ServerSelector, { type ServerOption } from "@/components/shared/ServerSelector";
 import {
   dockerMigrationApi,
+  deployApi,
   getApiErrorMessage,
   type DiscoveredStack,
   type DiscoveredGroup,
   type DiscoveredService,
+  type OpenshipProjectGroup,
   type MigrationRun,
   type MigrationStatus,
 } from "@/lib/api";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { randomUUID } from "@/lib/random-uuid";
 import { AppLogo } from "@/components/AppLogo";
+import { DeploymentTerminal } from "@/components/import-project/DeploymentTerminal";
 
 /** Platforms whose Docker/Compose apps this flow can adopt — shown as faint
  *  brand hints under the intro (decorative). Unknown marks fall back to a
@@ -141,6 +144,11 @@ export function ServerMigrationWizard({
   const [migrationId, setMigrationId] = useState<string | null>(null);
   const [confirmToken, setConfirmToken] = useState<string | null>(null);
   const [run, setRun] = useState<MigrationRun | null>(null);
+  // Per-service status peek (the failure rows). Full logs are shown by the
+  // embedded DeploymentTerminal (its own build-session stream), not here.
+  const [deploy, setDeploy] = useState<{
+    services?: Array<{ name: string; status: string; error?: string }>;
+  } | null>(null);
   const [cutoverBusy, setCutoverBusy] = useState(false);
 
   const reset = () => {
@@ -306,6 +314,12 @@ export function ServerMigrationWizard({
 
   // ── Derived ──────────────────────────────────────────────────────────────
   const adoptable = Boolean(stack?.adoptable);
+  // Openship projects on the server that this instance doesn't know → re-importable.
+  const orphanedOpenship = useMemo(
+    () => stack?.openshipProjects?.filter((p) => !p.knownHere) ?? [],
+    [stack],
+  );
+  const hasReimport = orphanedOpenship.length > 0;
   const sameServer = selectedId === targetId;
   // Cross-server can't move a locally-built image (not in a registry) — the API
   // blocks it with the exact service names. Surface the caveat up front when a
@@ -417,6 +431,17 @@ export function ServerMigrationWizard({
     if (pid) router.push(`/projects/${pid}/domains`);
   };
 
+  // On a deploy/verify failure the run row only carries a one-line reason. The
+  // real stepper, full logs, and per-service failure detail live on the target
+  // deployment's build screen — deep-link to it so "just failed" isn't a
+  // dead-end. (Only meaningful once the deploy started, i.e. deploymentId set.)
+  const openDeployLogs = () => {
+    const depId = run?.deploymentId;
+    if (!depId) return;
+    close();
+    router.push(`/build/${depId}`);
+  };
+
   // Poll the current run while a migration is in flight; stop once terminal.
   useEffect(() => {
     if (!migrationId) return;
@@ -438,6 +463,44 @@ export function ServerMigrationWizard({
     };
   }, [migrationId, run?.status]);
 
+  // Pull the target deploy's logs + per-service status while it's deploying/
+  // verifying (live) and once it fails — so the wizard shows the actual reason
+  // and log tail inline instead of only a one-line "partial_failure".
+  useEffect(() => {
+    const depId = run?.deploymentId;
+    const live = run?.status === "deploying" || run?.status === "verifying";
+    const failedNow = run?.status === "failed" || run?.status === "rolled_back";
+    if (!depId || (!live && !failedNow)) {
+      setDeploy(null);
+      return;
+    }
+    let on = true;
+    const tick = async () => {
+      try {
+        const st = await deployApi.getBuildStatus(depId);
+        if (!on) return;
+        setDeploy({
+          services: Array.isArray(st?.serviceStatuses)
+            ? st.serviceStatuses.map((s: Record<string, unknown>) => ({
+                name: String(s.serviceName ?? s.serviceId ?? "service"),
+                status: String(s.status ?? ""),
+                error: (s.errorMessage as string) || (s.error as string) || undefined,
+              }))
+            : undefined,
+        });
+      } catch {
+        /* transient */
+      }
+    };
+    void tick();
+    // Live phases keep polling; a terminal failure only needs one fetch.
+    const iv = live ? setInterval(tick, 2500) : null;
+    return () => {
+      on = false;
+      if (iv) clearInterval(iv);
+    };
+  }, [run?.deploymentId, run?.status]);
+
   const inProgress = Boolean(queue);
   const failed = run?.status === "failed" || run?.status === "rolled_back";
   // Only go near-full-screen once there are RESULTS to show (an adoptable stack
@@ -445,10 +508,11 @@ export function ServerMigrationWizard({
   // "nothing found" result all stay a compact, content-sized dialog.
   const expanded = adoptable || inProgress;
 
-  // The wide layout only exists to show the container table (scan/select). The
-  // progress phase has just a short step list — keep it in the compact,
-  // height-to-content shell so it doesn't float in a huge empty modal.
-  const wide = expanded && !inProgress;
+  // Wide layout for the scan/select table AND for the deploy phase — once a
+  // target deployment exists (deploying/verifying/failed) we mount the native
+  // terminal, which needs the full-width shell. Earlier progress phases
+  // (adopting/moving_data) have only a short step list → stay compact.
+  const wide = expanded && (!inProgress || Boolean(run?.deploymentId));
 
   return (
     <Modal
@@ -491,6 +555,7 @@ export function ServerMigrationWizard({
                 queueIndex={queueIndex}
                 queueTotal={queue?.length ?? 1}
                 completed={completed}
+                deployServices={deploy?.services}
               />
             </div>
             <div className="shrink-0 flex items-center justify-between gap-4 px-6 py-4 border-t border-border/60">
@@ -548,13 +613,24 @@ export function ServerMigrationWizard({
               ) : (
                 <>
                   <span />
-                  <button
-                    type="button"
-                    onClick={close}
-                    className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors shrink-0"
-                  >
-                    {failed ? m.wizard.close : m.wizard.cancel}
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {failed && run?.deploymentId && (
+                      <button
+                        type="button"
+                        onClick={openDeployLogs}
+                        className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors"
+                      >
+                        {m.run.viewDeployLogs}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={close}
+                      className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors"
+                    >
+                      {failed ? m.wizard.close : m.wizard.cancel}
+                    </button>
+                  </div>
                 </>
               )}
             </div>
@@ -622,14 +698,35 @@ export function ServerMigrationWizard({
               {/* Idle + loading keep the illustration (loading just pulses it). */}
               {!stack && !error && <EmptyHint scanning={scanning} status={scanStatus} />}
 
-              {/* Scanned but nothing adoptable → stay compact, show a "nothing
-                  found" state (not a giant empty modal). */}
-              {stack && !adoptable && <NoResults message={m.discover.nothing} />}
+              {/* Scanned but nothing adoptable AND nothing to re-import → compact
+                  "nothing found" (not a giant empty modal). */}
+              {stack && !adoptable && !hasReimport && <NoResults message={m.discover.nothing} />}
+
+              {/* Only Openship projects to re-import (no generic candidates): show
+                  the re-import section on its own. */}
+              {stack && !adoptable && hasReimport && (
+                <div className="h-full min-h-0 overflow-y-auto pr-1">
+                  <OpenshipReimportSection
+                    serverId={selectedId ?? ""}
+                    orphaned={orphanedOpenship}
+                    alreadyManaged={stack.alreadyManaged}
+                    onOpen={(pid) => router.push(`/projects/${pid}`)}
+                  />
+                </div>
+              )}
 
               {adoptable && stack && active && (
                 <div className="flex gap-5 h-full min-h-0">
                   {/* LEFT: discovered groups */}
                   <div className="flex-[3] min-w-0 overflow-y-auto pr-1 space-y-4">
+                    {hasReimport && (
+                      <OpenshipReimportSection
+                        serverId={selectedId ?? ""}
+                        orphaned={orphanedOpenship}
+                        alreadyManaged={stack.alreadyManaged}
+                        onOpen={(pid) => router.push(`/projects/${pid}`)}
+                      />
+                    )}
                     {stack.groups.map((group) => (
                       <ServiceGroup
                         key={groupKey(group)}
@@ -853,6 +950,128 @@ function NoResults({ message, isError }: { message: string; isError?: boolean })
       </div>
       <p className={`max-w-sm text-sm ${isError ? "text-destructive/90" : "text-muted-foreground"}`}>{message}</p>
     </div>
+  );
+}
+
+/**
+ * Openship projects recovered from the server (matched by the `openship.project`
+ * label + the on-server manifest) that this instance doesn't know — DB reset
+ * (DR) or a server from another instance. Re-import rebuilds the project records
+ * PRESERVING the original id so the running containers re-attach; it's records
+ * only (no move/redeploy), so a "redeploy to finalize" note follows.
+ */
+function OpenshipReimportSection({
+  serverId,
+  orphaned,
+  alreadyManaged,
+  onOpen,
+}: {
+  serverId: string;
+  orphaned: OpenshipProjectGroup[];
+  alreadyManaged: number;
+  onOpen: (projectId: string) => void;
+}) {
+  const { t } = useI18n();
+  const m = t.migration.reimport;
+  const [names, setNames] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [done, setDone] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const reimport = async (p: OpenshipProjectGroup) => {
+    setBusy(p.projectId);
+    setErrors((e) => ({ ...e, [p.projectId]: "" }));
+    try {
+      const res = await dockerMigrationApi.reimport({
+        serverId,
+        projectId: p.projectId,
+        projectName: (names[p.projectId] ?? p.suggestedName).trim() || undefined,
+      });
+      setDone((d) => ({ ...d, [p.projectId]: res.projectId }));
+    } catch (err) {
+      setErrors((e) => ({ ...e, [p.projectId]: getApiErrorMessage(err, m.failed) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="space-y-3 rounded-xl border border-info/30 bg-info/[0.06] p-4">
+      <div className="flex items-center gap-2">
+        <AppLogo className="size-4" />
+        <h3 className="text-sm font-semibold text-foreground">{m.title}</h3>
+        <span className="rounded-md bg-info/15 px-1.5 py-0.5 text-[11px] font-medium text-info">
+          {orphaned.length}
+        </span>
+      </div>
+      <p className="text-[13px] text-muted-foreground">{m.intro}</p>
+
+      <div className="grid grid-cols-1 gap-2 xl:grid-cols-2 items-stretch">
+        {orphaned.map((p) => {
+          const doneId = done[p.projectId];
+          const err = errors[p.projectId];
+          return (
+            <div
+              key={p.projectId}
+              className="flex h-full flex-col gap-2 rounded-lg border border-border/60 bg-card/60 p-3"
+            >
+              {doneId ? (
+                <div className="flex h-full flex-col justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-sm text-success">
+                    <CheckCircle2 className="size-4 shrink-0" />
+                    <span className="font-medium">{m.reimported}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onOpen(doneId)}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm font-medium text-foreground hover:bg-muted transition-colors"
+                  >
+                    {m.openProject}
+                    <ArrowRight className="size-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <input
+                    value={names[p.projectId] ?? p.suggestedName}
+                    onChange={(e) => setNames((n) => ({ ...n, [p.projectId]: e.target.value }))}
+                    className="w-full rounded-lg border border-border bg-background px-2.5 py-1.5 text-sm text-foreground outline-none focus:border-info"
+                    placeholder={p.suggestedName}
+                  />
+                  <div className="text-xs text-muted-foreground">
+                    {interpolate(m.services, { n: String(p.services.length) })}
+                    {p.domains && p.domains.length > 0 ? ` · ${p.domains.join(", ")}` : ""}
+                  </div>
+                  {err && <p className="text-xs text-danger">{err}</p>}
+                  <button
+                    type="button"
+                    disabled={busy === p.projectId || !serverId}
+                    onClick={() => reimport(p)}
+                    className="mt-auto inline-flex items-center justify-center gap-1.5 rounded-lg border border-info/50 bg-info/10 px-3 py-1.5 text-sm font-medium text-info hover:bg-info/20 transition-colors disabled:opacity-50"
+                  >
+                    {busy === p.projectId ? (
+                      <>
+                        <Loader2 className="size-3.5 animate-spin" />
+                        {m.working}
+                      </>
+                    ) : (
+                      m.action
+                    )}
+                  </button>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {alreadyManaged > 0 && (
+        <p className="text-xs text-muted-foreground">
+          {interpolate(m.alreadyManaged, { n: String(alreadyManaged) })}
+        </p>
+      )}
+      <p className="text-xs text-muted-foreground">{m.finalizeNote}</p>
+    </section>
   );
 }
 
@@ -1239,6 +1458,7 @@ function MigrationProgress({
   queueIndex,
   queueTotal,
   completed,
+  deployServices,
 }: {
   run: MigrationRun | null;
   error: string | null;
@@ -1246,6 +1466,7 @@ function MigrationProgress({
   queueIndex: number;
   queueTotal: number;
   completed: Array<{ name: string; projectId?: string | null }>;
+  deployServices?: Array<{ name: string; status: string; error?: string }>;
 }) {
   const { t } = useI18n();
   const m = t.migration;
@@ -1355,6 +1576,41 @@ function MigrationProgress({
           })}
         </ol>
       )}
+
+      {run?.deploymentId &&
+        (failed || status === "deploying" || status === "verifying") && (
+          <div className="space-y-2">
+            <p className="px-0.5 text-xs font-medium text-muted-foreground">{m.run.deployDetail}</p>
+            {deployServices && deployServices.length > 0 && (
+              <div className="space-y-1 rounded-xl border border-border/50 bg-muted/20 p-2.5">
+                {deployServices.map((s) => {
+                  const bad = /fail|error|crash|exit/i.test(s.status);
+                  const good = /ready|run|succeed|live|deployed|healthy/i.test(s.status);
+                  return (
+                    <div key={s.name} className="flex items-start gap-2 text-xs">
+                      <span
+                        className={`mt-1 inline-block size-1.5 shrink-0 rounded-full ${
+                          bad ? "bg-danger" : good ? "bg-success" : "bg-muted-foreground"
+                        }`}
+                      />
+                      <span className="font-mono text-foreground">{s.name}</span>
+                      <span className="text-muted-foreground">{s.status}</span>
+                      {s.error && <span className="min-w-0 flex-1 truncate text-danger">— {s.error}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {/* Native terminal — reuses the /deploy xterm (TerminalSurface +
+                useBuildStream attach-only), driven by the run's deploymentId.
+                Live while deploying/verifying, persisted logs on failure. */}
+            <DeploymentTerminal
+              deploymentId={run.deploymentId}
+              live={status === "deploying" || status === "verifying"}
+              className="h-[360px] w-full overflow-hidden rounded-xl border border-border/50"
+            />
+          </div>
+        )}
 
       {status === "awaiting_cutover" && (
         <div className="flex items-start gap-2 text-sm rounded-xl bg-success-bg text-success px-4 py-3">

@@ -1,9 +1,5 @@
 import type { DeploymentMetadata, MetadataParser } from "./types";
-
-/** Strip a UTF-8 BOM if present (Windows-saved manifests). */
-function stripBom(content: string): string {
-  return content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
-}
+import { splitLines } from "./text";
 
 /** Unquote a scalar YAML value ("npm start" / 'npm start' / npm start). */
 function unquote(value: string): string {
@@ -29,7 +25,7 @@ export const renderMetadataParser: MetadataParser = {
     const raw = fileContents["render.yaml"];
     if (!raw) return null;
 
-    const lines = stripBom(raw).split("\n");
+    const lines = splitLines(raw);
 
     let startCommand: string | undefined;
     let buildCommand: string | undefined;

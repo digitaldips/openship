@@ -106,6 +106,22 @@ export interface PrepareProjectResponse extends PrepareAppConfig {
   rootEnv?: Record<string, string>;
   /** Routing config parsed from the repo's vercel.json (persisted on the project). */
   routing?: RoutingConfig;
+  // ── Declared overlay (repo-root openship.json) — present only when the repo
+  //    ships the file. Seed wizard defaults; absent → detection is unchanged. ──
+  /** Declared serve mode ("static" ⇒ no server). Seeds `options.hasServer`. */
+  productionMode?: "host" | "static" | "standalone";
+  /** Declared runtime isolation. Seeds `runtimeMode` for a brand-new deploy. */
+  runtimeMode?: "bare" | "docker";
+  /** Declared project domains, normalized to the create shape. Seed endpoints. */
+  publicEndpoints?: Array<{
+    domain?: string;
+    customDomain?: string;
+    domainType?: "free" | "custom";
+    port?: number;
+    targetPath?: string;
+  }>;
+  /** Declared cloud sizing (tier OR explicit cpu/mem/disk). Seeds resource tier. */
+  resources?: { tier?: "micro" | "low" | "medium" | "high"; cpuCores?: number; memoryMb?: number; diskMb?: number };
   error?: string;
   current_status?: string;
   exists?: boolean;

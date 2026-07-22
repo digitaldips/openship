@@ -38,20 +38,53 @@
 
 ## Quick Start
 
+Pick by how you work — **solo → desktop app**, **team / always-on → CLI on a server**.
+
+### Solo — desktop app
+
+The control plane runs on your machine and drives your servers over SSH; nothing of Openship is exposed publicly. Download, open, done — no terminal needed:
+
+| Platform | Download |
+|---|---|
+| **macOS** (Apple Silicon) | [Openship-arm64.dmg](https://github.com/oblien/openship/releases/latest/download/Openship-arm64.dmg) |
+| **macOS** (Intel) | [Openship-x64.dmg](https://github.com/oblien/openship/releases/latest/download/Openship-x64.dmg) |
+| **Windows** | [Openship-win32-x64.zip](https://github.com/oblien/openship/releases/latest/download/Openship-win32-x64.zip) |
+| **Linux** | [Openship.AppImage](https://github.com/oblien/openship/releases/latest/download/Openship.AppImage) |
+
+Linux: `chmod +x Openship.AppImage && ./Openship.AppImage`. Links always point at the newest release.
+
+### Team / always-on — CLI on a server
+
+Install the CLI (it bundles the API + dashboard), then run **`openship`** — an interactive wizard creates the first admin, wires your domain, and installs itself as a boot service. Run it again anytime to manage the instance.
+
 ```bash
-npm i -g openship     # or: curl -fsSL https://get.openship.io | sh
-openship up           # installs Openship as a background service (starts on boot, auto-restarts)
+curl -fsSL https://get.openship.io | sh             # install  (or: npm i -g openship)
+openship                                            # interactive setup, then control panel
 ```
 
-`openship open` opens the dashboard; `openship stop` stops the service. Want a one-off attached run instead? `openship up --foreground`. To deploy a project:
+For CI / headless boxes, skip the wizard and drive `openship up` directly — same background service, boots and auto-restarts:
+
+```bash
+openship up                                          # background service on this machine
+openship up --public-url https://openship.example.com   # + expose on your domain (edge + TLS handled)
+```
+
+`openship open` opens the dashboard · `openship stop` stops it · `openship update` upgrades · `openship up --foreground` runs attached.
+
+**Deploy a project:**
 
 ```bash
 cd your-project
-openship init         # link this directory to a project
+openship init          # link this directory to a project
 openship deploy
 ```
 
-Prefer Docker? Clone the repo and use the compose stack:
+Full server guide + complete CLI reference: **[docs/installation.md](docs/installation.md)**.
+
+<details>
+<summary>Advanced: run from source with Docker Compose (not the recommended path)</summary>
+
+Heavier than the CLI, and the compose stack gives the control-plane container access to the host Docker daemon (host-privileged) — use it only if you specifically need a containerized control plane. The CLI and desktop app above are the supported installs.
 
 ```bash
 git clone https://github.com/oblien/openship.git && cd openship
@@ -59,9 +92,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Or grab the desktop app (`openship install`, or download from [openship.io](https://openship.io)).
-
-**Which setup?** Working solo → use the **desktop app**: the control plane runs on your machine and drives your servers over SSH, with nothing of Openship exposed publicly. Running for a team, need always-on / remote access / push-to-deploy → **self-host on a server** (`openship up --public-url …`). Full guide, server install, and the CLI command reference: **[docs/installation.md](docs/installation.md)**.
+</details>
 
 ---
 
@@ -71,7 +102,7 @@ Point it at a repo. Openship detects your stack, builds it, configures everythin
 
 Databases, domains, SSL, CDN, mail, backups — all managed from one place.
 
-Works with **Openship Cloud** (managed) or **any Linux server** you own. Solo devs shipping side projects and teams running production use the same tool.
+Solo devs shipping side projects and teams running production use the same tool.
 
 ---
 

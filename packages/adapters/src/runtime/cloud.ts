@@ -64,7 +64,7 @@ import { createDockerBuildContext } from "./docker-build-context";
 import { normalizeDockerRelativePath, resolveDockerfileCandidates } from "./docker-paths";
 import { runLocalBuild } from "./local-build";
 import { transferLocalDirectory } from "./transfer";
-import { prepareStackOutput, resolveProjectDir } from "./stack-output";
+import { prepareStackOutput, resolveProjectDir, resolveStaticOutputPath } from "./stack-output";
 import { checkGit } from "../system/checks";
 import { installGit } from "../system/installer";
 import { isRuntimeNotFoundError } from "../system/errors";
@@ -1713,14 +1713,6 @@ fi`;
     }
 
     // 1. Create page via Pages API - export build output from workspace
-    const outputPath = config.outputDirectory.startsWith("/")
-      ? config.outputDirectory
-      : `/app/${config.outputDirectory}`;
-
-    console.log(
-      `Deploying static site from workspace ${workspaceId}, output path ${outputPath}...`,
-    );
-
     const primaryEndpoint = primaryPublicEndpoint(config);
     const primarySlug = endpointSlug(primaryEndpoint);
     const primaryCustomDomain = endpointCustomDomain(primaryEndpoint);
@@ -1749,6 +1741,12 @@ fi`;
     if (!trimmedOutput || trimmedOutput === "/") {
       throw outputDirError();
     }
+
+    // Confine under /app; "." → "/app", not the "/app/." the Pages API rejects (#66).
+    const outputPath = resolveStaticOutputPath("/app", config.outputDirectory);
+    console.log(
+      `Deploying static site from workspace ${workspaceId}, output path ${outputPath}...`,
+    );
 
     // Create a brand-new page bound the way this deploy wants. Free subdomains
     // live on the shared `.opsh.io` zone (an account-level op): a namespace

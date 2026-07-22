@@ -65,10 +65,8 @@ export function UpdateCenter() {
 
   const advisory = state?.advisories[0]; // most severe first
   // An in-flight download/install owns the top surface — suppress the advisory
-  // and "update available" banners so we never show "update available" next to
-  // its own progress bar.
+  // banner so we never stack it next to its own progress bar.
   const updating = desktop && updatePhase !== "idle";
-  const showUpdate = !updating && !advisory && !muted && state?.updateAvailable;
   const updatingVersion = state?.latestVersion ?? latest?.version ?? "";
   const pct = Math.round(Math.min(1, Math.max(0, updateProgress)) * 100);
   const changelog = state?.latestChangelogUrl ?? "https://github.com/oblien/openship/releases";
@@ -171,40 +169,11 @@ export function UpdateCenter() {
         );
       })()}
 
-      {/* ── Update available (no advisory) ──────────────────────────── */}
-      {showUpdate && (
-        <div className="px-4 pt-4 sm:px-6 sm:pt-6">
-          <div className="flex items-center gap-3 rounded-2xl border border-border/60 bg-card px-4 py-3">
-            <div className="shrink-0 text-primary">
-              <Download className="size-5" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="text-[13.5px] text-foreground">
-                <span className="font-semibold">Openship {state?.latestVersion}</span> {w.available}
-                {state?.currentVersion ? <span className="text-muted-foreground"> {interpolate(w.youreOn, { version: state.currentVersion })}</span> : null}
-              </p>
-              {!desktop && (
-                <p className="mt-0.5 text-[12px] text-muted-foreground">
-                  {w.rerunInstall}
-                </p>
-              )}
-            </div>
-            <div className="flex shrink-0 items-center gap-3">
-              {desktop && (
-                <button
-                  type="button"
-                  onClick={beginUpdate}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3 py-1.5 text-[13px] font-medium text-background transition-opacity hover:opacity-90"
-                >
-                  <Download className="size-3.5" />
-                  {w.updateNow}
-                </button>
-              )}
-              <ExternalLinkBtn href={changelog}>{w.changelog}</ExternalLinkBtn>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* A bare "newer version exists" no longer raises a banner — that's the
+          nagging-every-release problem. It's surfaced quietly instead: the home
+          Updates block and Settings → Updates both show "vX available" + Update.
+          The top banner is reserved for a deliberate release advisory (below),
+          an operator platform notice, or the post-update "what's new" note. */}
 
       {/* ── "What's new" card (once, after an update) ───────────────── */}
       {whatsNewVersion && (

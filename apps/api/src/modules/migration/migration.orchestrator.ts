@@ -246,12 +246,13 @@ class MigrationOrchestratorImpl {
       await this.transition(id, "verifying");
       const verified = await this.waitForDeployment(deploymentId);
       if (!verified || verified.status !== "ready") {
-        // Surface WHY, not a dead-end "did not become ready": the target
-        // deployment's own error, its terminal status, or a timeout.
+        // Surface WHY, not a dead-end "did not become ready": a timeout, or the
+        // deployment's own error PLUS which service(s) failed (so a
+        // "partial_failure" names the culprit instead of a bare status).
         const mins = Math.round(VERIFY_TIMEOUT_MS / 60000);
         const reason = !verified
           ? `it was still deploying after ${mins} minutes`
-          : verified.errorMessage?.trim() || `the deployment ended as "${verified.status}"`;
+          : await this.describeDeployFailure(deploymentId, verified);
         throw new Error(`The target deployment did not become ready — ${reason}.`);
       }
 
@@ -428,6 +429,36 @@ class MigrationOrchestratorImpl {
       await new Promise((r) => setTimeout(r, VERIFY_POLL_MS));
     }
     return null;
+  }
+
+  /** A human reason for a non-ready terminal deploy: the deployment's own error
+   *  if set, PLUS which service(s) failed and why — so "partial_failure" tells
+   *  the operator the culprit inline (full logs are on the deploy's build
+   *  screen, linked from the wizard). Best-effort; falls back to the status. */
+  private async describeDeployFailure(
+    deploymentId: string,
+    dep: NonNullable<Awaited<ReturnType<typeof repos.deployment.findById>>>,
+  ): Promise<string> {
+    let failedSvcs = "";
+    try {
+      const rows = await repos.serviceDeployment.listByDeployment(deploymentId);
+      const failed = rows.filter((r) => /fail|error/i.test(r.status));
+      if (failed.length > 0) {
+        failedSvcs = failed
+          .map((r) => {
+            const name = r.serviceName || r.serviceId;
+            const err = (r.errorMessage || r.error || "").trim();
+            return err ? `${name} (${err})` : name;
+          })
+          .join(", ");
+      }
+    } catch {
+      /* best-effort — never let diagnostics enrichment throw */
+    }
+    const base = dep.errorMessage?.trim();
+    if (base && failedSvcs) return `${base} — failed: ${failedSvcs}`;
+    if (failedSvcs) return `${dep.status} — failed: ${failedSvcs}`;
+    return base || `the deployment ended as "${dep.status}"`;
   }
 
   /** Destroy the originals on the source (by scanned container id — they carry

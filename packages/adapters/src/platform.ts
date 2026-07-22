@@ -70,13 +70,6 @@ export interface PlatformConfig {
   bare?: BareRuntimeOptions;
   /** Nginx provider options for self-hosted routing + SSL */
   nginx?: Omit<NginxProviderOptions, "executor" | "paths">;
-  /**
-   * External edge: a reverse proxy (e.g. Caddy) already owns ingress + TLS on
-   * this host. When set, OpenShip skips OpenResty/certbot entirely (routing/SSL
-   * handled externally) and relies on the `openship.project` container label for
-   * an external sync service to discover and publish deployed apps.
-   */
-  externalEdge?: boolean | string;
   /** Oblien client ID (cloud target - master creds) */
   cloudClientId?: string;
   /** Oblien client secret (cloud target - master creds) */
@@ -230,18 +223,6 @@ async function createInfraProvider(
   config: PlatformConfig,
   executor: CommandExecutor,
 ): Promise<{ routing: RoutingProvider; ssl: SslProvider }> {
-  // External edge: a reverse proxy (e.g. Caddy) already owns ingress + TLS on
-  // this host. OpenShip must NOT install/configure OpenResty — routing and SSL
-  // are handled externally, and the deployed containers are discovered via their
-  // `openship.project` label by an external sync service (see openship-caddy-sync).
-  const externalEdge = /^(1|true|yes)$/i.test(
-    (config.externalEdge ?? process.env.OPENSHIP_EXTERNAL_EDGE ?? "").toString().trim(),
-  );
-  if (externalEdge) {
-    const { NoopInfraProvider } = await import("./infra/noop");
-    return { routing: new NoopInfraProvider(), ssl: new NoopInfraProvider() };
-  }
-
   const { detectOpenRestyPaths, ensureOpenRestyConfig, ensureLuaScripts } = await import(
     "./infra/openresty-lua"
   );
@@ -278,15 +259,11 @@ async function createSelfHostedPlatform(config: PlatformConfig): Promise<Platfor
 
   // System - runtime mode determines all required components
   const { SystemManager } = await import("./system/setup");
-  const externalEdge = /^(1|true|yes)$/i.test(
-    (config.externalEdge ?? process.env.OPENSHIP_EXTERNAL_EDGE ?? "").toString().trim(),
-  );
   const system = new SystemManager(runtimeMode, {
     executor,
     stateStore: config.stateStore,
     installerConfig: config.installerConfig,
     provisionLock: config.provisionLock,
-    externalEdge,
   });
 
   // Runtime

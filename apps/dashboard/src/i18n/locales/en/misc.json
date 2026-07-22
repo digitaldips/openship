@@ -89,7 +89,9 @@
     "signedInAs": "Signed in as",
     "authorizing": "Authorizing…",
     "authorize": "Authorize",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "deviceDoneTitle": "Connected to Openship Cloud",
+    "deviceDoneBody": "You can close this tab and return to your terminal — setup will continue automatically."
   },
   "cloudConnect": {
     "noCode": "The authentication code was not provided. Please try again.",

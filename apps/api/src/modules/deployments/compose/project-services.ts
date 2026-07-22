@@ -14,7 +14,6 @@
 import { repos, type Project, type Service } from "@repo/db";
 import { getProjectType, type StackId } from "@repo/core";
 import { serviceKind, type DeployableService } from "../../../lib/deployable-service";
-import { getRoutingBaseDomain } from "../../../lib/routing-domains";
 export { serviceKind } from "../../../lib/deployable-service";
 
 export function isMultiServiceProject(project: Pick<Project, "framework">): boolean {
@@ -69,13 +68,8 @@ export function projectServicesToDeployableServices(services: Service[]): Deploy
     exposed: s.exposed,
     exposedPort: s.exposedPort ?? undefined,
     domain: s.domain ?? undefined,
-    customDomain: s.customDomain || (String(s.name || "service").replace(/[^a-zA-Z0-9-]/g, "") || "service") + "." + getRoutingBaseDomain(),
-    // Self-hosted fix: monorepo/compose services default to domainType:"free",
-    // which makes the deploy preflight require Openship Cloud (403). Force
-    // "custom" so deploys target the operator's own server + their wildcard
-    // DNS (resolves -> cloud requirement = "none"). An explicitly-set custom
-    // domain is honoured; otherwise we derive <svc>.ship.<baseDomain>.
-    domainType: "custom",
+    customDomain: s.customDomain ?? undefined,
+    domainType: s.domainType === "custom" ? "custom" : "free",
     publicEndpoints: (s.publicEndpoints as DeployableService["publicEndpoints"]) ?? undefined,
     rootDirectory: s.rootDirectory ?? undefined,
     installCommand: s.installCommand ?? undefined,

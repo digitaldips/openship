@@ -27,6 +27,7 @@ import {
   validateConnectRedirect,
   buildAuthHandoff,
   generateHandoffCode,
+  findHandoffCodeByState,
   mintSession,
 } from "../../lib/cloud-auth-proxy";
 import { runCloudPreflight } from "../../lib/cloud-preflight";
@@ -264,6 +265,9 @@ export async function connectHandoff(c: Context) {
   consentUrl.searchParams.set("redirect", validation.url.toString());
   consentUrl.searchParams.set("state", state);
   consentUrl.searchParams.set("code_challenge", codeChallenge);
+  // Forward the device/poll marker so the consent page confirms in-place
+  // (headless CLI) instead of navigating to a callback the box can't serve.
+  if (c.req.query("mode") === "device") consentUrl.searchParams.set("mode", "device");
   return c.redirect(consentUrl.toString());
 }
 
@@ -346,6 +350,9 @@ export async function connectAuthorize(c: Context) {
       },
       linked.token,
       codeChallenge,
+      // Record `state` so a headless CLI (device/poll flow) can retrieve this
+      // code via connect-poll instead of catching the browser redirect.
+      state,
     );
     const callbackUrl = new URL(validation.url.toString());
     callbackUrl.searchParams.set("code", code);
@@ -374,6 +381,31 @@ export async function exchangeCode(c: Context) {
   }
 
   return c.json({ data: result });
+}
+
+// ─── Device/poll flow (headless CLI — no browser redirect back to the box) ───
+
+/**
+ * GET /api/cloud/connect-poll?state=<state>
+ *
+ * The server-friendly half of cloud-connect: a CLI running on a remote box
+ * (over SSH) can't receive the browser redirect to its own loopback listener,
+ * so instead it POLLS here with the unguessable `state` it generated. Returns
+ * the one-time handoff code once the user has clicked Authorize in their
+ * browser, else `{ status: "pending" }`.
+ *
+ * No session (the CLI has no SaaS cookie). Security rests on: `state` is a
+ * 128+-bit capability never shown to the user; the returned `code` is still
+ * PKCE-locked (worthless without the verifier the CLI holds) and one-time at
+ * exchange; the endpoint is rate-limited per-IP.
+ */
+export async function connectPoll(c: Context) {
+  const state = c.req.query("state");
+  if (!state || state.length < 16 || state.length > 256) {
+    return c.json({ error: "state is required", code: "MISSING_STATE" }, 400);
+  }
+  const code = await findHandoffCodeByState(state);
+  return code ? c.json({ status: "ready", code }) : c.json({ status: "pending" });
 }
 
 // ─── Managed edge proxy sync ─────────────────────────────────────────────────

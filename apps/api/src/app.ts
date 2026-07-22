@@ -288,6 +288,17 @@ if (env.CLOUD_MODE) {
     )
     .catch((err) => console.warn("[boot] reconcileJobs failed:", err));
 
+  // Self-hosted (single box): any job_run still "running" at boot was orphaned
+  // by a crash/restart mid-run — close it out so the Jobs UI doesn't show a
+  // perpetual "Running" spinner. Not run in CLOUD_MODE, where a shared queue +
+  // multiple replicas mean a "running" row may be live on another replica.
+  if (!env.CLOUD_MODE) {
+    void repos.jobRun
+      .failStaleRunning()
+      .then((n) => n > 0 && console.log(`[boot] reconciled ${n} orphaned job run(s)`))
+      .catch((err) => console.warn("[boot] failStaleRunning failed:", err));
+  }
+
   // Hourly billing-period rollover — re-arms Oblien quota for orgs
   // whose current_period_end has passed (safety net for paid orgs
   // whose Stripe webhook lagged, and the primary mechanism for

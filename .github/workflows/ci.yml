@@ -43,3 +43,32 @@ jobs:
             echo "Typecheck failed (non-fumadocs errors above)"
             exit 1
           fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache bun install
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Runs `turbo run test` → vitest across every package that defines a test
+      # script (@repo/core, @repo/adapters, @repo/db [PGlite — no external DB],
+      # apps/api, apps/dashboard). Packages resolve to src, so no build needed.
+      - name: Run tests
+        run: bun run test
